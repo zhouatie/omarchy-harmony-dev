@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "harmony.dev",
+  "name": "HarmonyOS Remote Build",
+  "version": "1.0.0",
+  "author": "zhouatie",
+  "license": "MIT",
+  "description": "HarmonyOS 鸿蒙远程满速构建与本地真机自动安装插件，支持远程编译、代码同步与实时日志",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "HarmonyOS Build",
+    "description": "鸿蒙远程满速构建、增量代码同步、真机安装及参数配置面板",
+    "category": "Development",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": {
+      "macHost": "chenbolun@10.221.68.124",
+      "remoteDir": "~/Dev/harmony",
+      "projectPath": ""
+    },
+    "schema": [
+      {
+        "key": "macHost",
+        "type": "string",
+        "label": "远程 Mac 主机 (user@ip)",
+        "defaultValue": "chenbolun@10.221.68.124"
+      },
+      {
+        "key": "remoteDir",
+        "type": "string",
+        "label": "远程基础目录",
+        "defaultValue": "~/Dev/harmony"
+      },
+      {
+        "key": "projectPath",
+        "type": "string",
+        "label": "本地工程路径 (留空自动检测)",
+        "defaultValue": ""
+      }
+    ]
+  }
+}
