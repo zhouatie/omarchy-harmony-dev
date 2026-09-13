@@ -55,7 +55,7 @@ notify_desktop() {
   local msg="$2"
   local urgency="${3:-normal}"
   if command -v omarchy-notification-send >/dev/null 2>&1; then
-    omarchy-notification-send -g "📱" -u "$urgency" "$title" "$msg" 2>/dev/null || true
+    omarchy-notification-send -g "" -u "$urgency" "$title" "$msg" 2>/dev/null || true
   elif command -v notify-send >/dev/null 2>&1; then
     notify-send -u "$urgency" "$title" "$msg" 2>/dev/null || true
   fi
