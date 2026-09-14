@@ -89,8 +89,30 @@ BarWidget {
   property int expandAllTrigger: 0
   property bool expandAllValue: true
 
-  // 视图切换: "main" (构建管理控制台) | "git" (Git 仓库与改动详情面板)
+  // 视图切换: "main" (构建管理控制台) | "git" (Git 仓库与改动详情面板) | "mr" (未合并主干分支清单)
   property string currentView: "main"
+
+  // 主干分支与待提 MR 状态
+  property string trunkBranch: ""
+  property string inputTrunkBranch: ""
+  property int gitUnmergedCount: 0
+  property var gitMrUnmergedList: []
+  property var gitMrMergedList: []
+  property string copyFeedback: ""
+
+  Timer {
+    id: copyFeedbackTimer
+    interval: 2000
+    onTriggered: root.copyFeedback = ""
+  }
+  function copyBranchName(branchName) {
+    root.copyFeedback = "已复制: " + branchName
+    copyFeedbackTimer.restart()
+    Quickshell.execDetached([
+      "sh", "-c",
+      "printf '%s' '" + branchName + "' | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null)"
+    ])
+  }
 
   // 配置变量 (直接在插件中填写)
   property string inputMacHost: "chenbolun@10.221.68.124"
@@ -129,10 +151,14 @@ BarWidget {
         if (root.gitShellBehind > 0) tags.push("需 pull " + root.gitShellBehind)
         if (root.gitLibsDirtyCount > 0) tags.push(root.gitLibsDirtyCount + " 子仓改动")
         if (root.gitLibsBehindCount > 0) tags.push(root.gitLibsBehindCount + " 子仓需 pull")
+        if (root.gitUnmergedCount > 0) tags.push("待提MR " + root.gitUnmergedCount + " 仓")
         lines.push("• Git 状态: " + root.gitShellBranch + " (" + tags.join(" · ") + ")")
       }
     } else {
       lines.push("• 当前工程: 未检测到 (可在面板中指定)")
+    }
+    if (root.gitUnmergedCount > 0) {
+      lines.push("• 待提 MR: " + root.gitUnmergedCount + " 个仓库包含未合并到主干的代码")
     }
     if (root.building) {
       lines.push("• 状态: 正在构建 (" + root.buildElapsedSeconds + "s) - " + root.buildStage)
@@ -148,6 +174,7 @@ BarWidget {
     function close(): void { root.close() }
     function toggle(): void { root.togglePanel() }
     function refresh(): void { root.refreshStatus(); root.refreshGitStatus(false); }
+    function mr(): void { root.open(); root.currentView = "mr"; }
     function build(): void { root.startBuild("all") }
     function sync(): void { root.startBuild("sync-only") }
     function install(): void { root.startBuild("install-only") }
@@ -205,6 +232,7 @@ BarWidget {
       macHost: root.inputMacHost,
       remoteDir: root.inputRemoteDir,
       projectPath: root.inputProjectPath,
+      trunkBranch: root.inputTrunkBranch,
       autoInstall: root.autoInstall,
       autoLaunch: root.autoLaunch
     })
@@ -231,6 +259,9 @@ BarWidget {
     var path = root.inputProjectPath || root.projectPath
     if (path) {
       args.push("--path", path)
+    }
+    if (root.inputTrunkBranch) {
+      args.push("--trunk", root.inputTrunkBranch)
     }
     if (doFetch) {
       args.push("--fetch")
@@ -322,6 +353,10 @@ BarWidget {
         }
         if (cfg.remoteDir) root.inputRemoteDir = cfg.remoteDir
         if (cfg.projectPath !== undefined) root.inputProjectPath = cfg.projectPath
+        if (cfg.trunkBranch !== undefined) {
+          root.inputTrunkBranch = cfg.trunkBranch
+          root.trunkBranch = cfg.trunkBranch
+        }
         if (cfg.autoInstall !== undefined) root.autoInstall = cfg.autoInstall
         if (cfg.autoLaunch !== undefined) root.autoLaunch = cfg.autoLaunch
         root.refreshStatus()
@@ -402,6 +437,17 @@ BarWidget {
         var res = JSON.parse(text)
         root.gitOk = (res.ok === true)
         if (res.ok) {
+          if (res.trunk_branch) {
+            root.trunkBranch = res.trunk_branch
+            if (!root.inputTrunkBranch) {
+              root.inputTrunkBranch = res.trunk_branch
+            }
+          }
+          if (res.mr_summary) {
+            root.gitUnmergedCount = res.mr_summary.total_unmerged_repos || 0
+            root.gitMrUnmergedList = res.mr_summary.unmerged_list || []
+            root.gitMrMergedList = res.mr_summary.merged_feature_list || []
+          }
           if (res.shell && res.shell.is_git) {
             root.gitShellBranch = res.shell.branch || ""
             root.gitShellClean = res.shell.clean === true
@@ -793,6 +839,67 @@ BarWidget {
                 }
               }
             }
+
+            // Tab 3: 待合主干 (MR)
+            Rectangle {
+              height: Style.space(30)
+              width: tab3Row.implicitWidth + Style.space(24)
+              radius: Style.space(6)
+              color: root.currentView === "mr" ? root.colors.surface1 : root.colors.surface0
+              border.color: root.currentView === "mr" ? root.colors.peach : root.colors.surface1
+              border.width: 1
+
+              MouseArea {
+                id: tab3Area
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.currentView = "mr"
+              }
+
+              Row {
+                id: tab3Row
+                anchors.centerIn: parent
+                spacing: Style.space(6)
+
+                Text {
+                  text: "\uf126"
+                  color: root.currentView === "mr" ? root.colors.peach : root.colors.subtext0
+                  font.family: "JetBrainsMono Nerd Font, monospace"
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  text: "待合主干 (MR)"
+                  color: root.currentView === "mr" ? root.colors.text : root.colors.subtext0
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: root.currentView === "mr"
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // 待提 MR 计数徽章
+                Rectangle {
+                  visible: root.gitUnmergedCount > 0
+                  height: Style.space(16)
+                  width: mrBadgeCountText.implicitWidth + Style.space(8)
+                  radius: Style.space(8)
+                  color: root.colors.peach
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    id: mrBadgeCountText
+                    anchors.centerIn: parent
+                    text: "" + root.gitUnmergedCount
+                    color: root.colors.crust
+                    font.family: "JetBrainsMono Nerd Font, monospace"
+                    font.pixelSize: Style.font.caption * 0.75
+                    font.bold: true
+                  }
+                }
+              }
+            }
           }
 
           PanelSeparator { foreground: root.colors.surface1 }
@@ -805,6 +912,60 @@ BarWidget {
             width: parent.width
             spacing: Style.space(12)
             visible: root.currentView === "main"
+
+            // 待提 MR 提醒横幅 (点击快速跳转 MR 面板)
+            Rectangle {
+              visible: root.gitUnmergedCount > 0
+              width: parent.width
+              height: Style.space(34)
+              radius: Style.space(6)
+              color: Qt.rgba(250/255, 179/255, 135/255, 0.12)
+              border.color: root.colors.peach
+              border.width: 1
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.currentView = "mr"
+              }
+
+              Row {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(8)
+
+                Text {
+                  text: "\uf126"
+                  color: root.colors.peach
+                  font.family: "JetBrainsMono Nerd Font, monospace"
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  text: "待提 MR 提醒：检测到 " + root.gitUnmergedCount + " 个仓库有代码未合入主干 [" + (root.trunkBranch || "trunk") + "]"
+                  color: root.colors.peach
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Item {
+                  width: Style.space(1)
+                  height: Style.space(1)
+                }
+
+                Text {
+                  text: "点击查看待合并主干清单 →"
+                  color: root.colors.blue
+                  font.pixelSize: Style.font.caption * 0.9
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+            }
 
             // -----------------------------------------------------------------
             // 2. 环境感知卡片 (Mac SSH / USB 真机 / 鸿蒙工程)
@@ -1144,6 +1305,41 @@ BarWidget {
                     radius: Style.space(4)
                     color: root.colors.mantle
                     border.color: projectPathInput.activeFocus ? root.colors.blue : root.colors.surface1
+                    border.width: 1
+                  }
+                }
+              }
+
+              // 输入项 4: 目标主干分支
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: Style.space(90)
+                  text: "目标主干分支:"
+                  color: root.colors.subtext0
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                TextField {
+                  id: trunkBranchInput
+                  width: parent.width - Style.space(98)
+                  height: Style.space(28)
+                  text: root.inputTrunkBranch
+                  onTextEdited: root.inputTrunkBranch = text
+                  placeholderText: "如 " + (root.trunkBranch || "release-20260921 或 master") + " (留空将自动智能识别)"
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  color: root.colors.text
+                  selectionColor: root.colors.surface2
+                  selectedTextColor: root.colors.text
+                  placeholderTextColor: root.colors.overlay0
+                  background: Rectangle {
+                    radius: Style.space(4)
+                    color: root.colors.mantle
+                    border.color: trunkBranchInput.activeFocus ? root.colors.peach : root.colors.surface1
                     border.width: 1
                   }
                 }
@@ -1719,6 +1915,60 @@ BarWidget {
           width: parent.width
           spacing: Style.space(12)
           visible: root.currentView === "git"
+
+          // 待提 MR 提醒条
+          Rectangle {
+            visible: root.gitUnmergedCount > 0
+            width: parent.width
+            height: Style.space(34)
+            radius: Style.space(6)
+            color: Qt.rgba(250/255, 179/255, 135/255, 0.12)
+            border.color: root.colors.peach
+            border.width: 1
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.currentView = "mr"
+            }
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(8)
+
+              Text {
+                text: "\uf126"
+                color: root.colors.peach
+                font.family: "JetBrainsMono Nerd Font, monospace"
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                text: "待合主干：发现 " + root.gitUnmergedCount + " 个仓库包含未合入主干 [" + (root.trunkBranch || "trunk") + "] 的代码，请注意提 MR"
+                color: root.colors.peach
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Item {
+                width: Style.space(1)
+                height: Style.space(1)
+              }
+
+              Text {
+                text: "查看待提 MR 清单 →"
+                color: root.colors.blue
+                font.pixelSize: Style.font.caption * 0.9
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+          }
 
           // 1. 顶部操作与返回条
           Rectangle {
@@ -2649,7 +2899,788 @@ BarWidget {
               }
             }
           }
-        }
+        } // 关闭 gitViewCol
+
+        // -------------------------------------------------------------------
+        // 视图 3: 主仓与子仓未合并主干分支清单视图 (当 currentView === "mr")
+        // -------------------------------------------------------------------
+        Column {
+          id: mrViewCol
+          width: parent.width
+          spacing: Style.space(12)
+          visible: root.currentView === "mr"
+
+          // 1. 顶部操作与主干分支配置条
+          Rectangle {
+            width: parent.width
+            implicitHeight: mrTopItemCol.implicitHeight + Style.space(16)
+            radius: Style.space(6)
+            color: root.colors.surface0
+            border.color: root.colors.surface1
+            border.width: 1
+
+            Column {
+              id: mrTopItemCol
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              spacing: Style.space(8)
+
+              // 第一行：返回按钮、反馈与右侧刷新操作
+              Item {
+                width: parent.width
+                height: Style.space(26)
+
+                // 返回控制台按钮
+                Rectangle {
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  height: Style.space(26)
+                  width: mrBackBtnRow.implicitWidth + Style.space(16)
+                  radius: Style.space(4)
+                  color: mrBackBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                  MouseArea {
+                    id: mrBackBtnArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.currentView = "main"
+                  }
+
+                  Row {
+                    id: mrBackBtnRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(6)
+                    Text {
+                      text: "\uf060"
+                      color: root.colors.blue
+                      font.family: "JetBrainsMono Nerd Font, monospace"
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      text: "返回控制台"
+                      color: root.colors.text
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+
+                // 复制成功提示
+                Text {
+                  anchors.centerIn: parent
+                  visible: root.copyFeedback !== ""
+                  text: root.copyFeedback
+                  color: root.colors.green
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                // 右侧：检查远端 (Fetch) 与 刷新
+                Row {
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(6)
+
+                  Rectangle {
+                    height: Style.space(26)
+                    width: mrViewFetchText.implicitWidth + Style.space(14)
+                    radius: Style.space(4)
+                    color: mrViewFetchArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                    MouseArea {
+                      id: mrViewFetchArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      enabled: !root.gitChecking
+                      onClicked: root.refreshGitStatus(true)
+                    }
+
+                    Row {
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+                      Text {
+                        text: "\uf0ed"
+                        color: root.colors.subtext0
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.caption * 0.85
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                      Text {
+                        id: mrViewFetchText
+                        text: "检查远端更新 (Fetch)"
+                        color: root.colors.text
+                        font.pixelSize: Style.font.caption * 0.85
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+                  }
+
+                  Rectangle {
+                    width: Style.space(26)
+                    height: Style.space(26)
+                    radius: Style.space(4)
+                    color: mrViewRefreshArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                    MouseArea {
+                      id: mrViewRefreshArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      enabled: !root.gitChecking
+                      onClicked: root.refreshGitStatus(false)
+                    }
+
+                    Text {
+                      id: mrViewRefreshIcon
+                      anchors.centerIn: parent
+                      text: "\uf021"
+                      color: root.colors.text
+                      font.family: "JetBrainsMono Nerd Font, monospace"
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    RotationAnimator {
+                      target: mrViewRefreshIcon
+                      from: 0
+                      to: 360
+                      duration: 800
+                      loops: Animation.Infinite
+                      running: root.gitChecking
+                    }
+                  }
+                }
+              }
+
+              // 第二行：目标主干分支设置与快捷切换
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  text: "对比目标主干:"
+                  color: root.colors.subtext0
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                TextField {
+                  id: mrTrunkInput
+                  width: Style.space(160)
+                  height: Style.space(24)
+                  text: root.inputTrunkBranch
+                  onTextEdited: root.inputTrunkBranch = text
+                  onAccepted: root.refreshGitStatus(false)
+                  placeholderText: root.trunkBranch || "主干分支名"
+                  font.family: "JetBrainsMono Nerd Font, monospace"
+                  font.pixelSize: Style.font.caption * 0.9
+                  color: root.colors.text
+                  background: Rectangle {
+                    radius: Style.space(3)
+                    color: root.colors.mantle
+                    border.color: mrTrunkInput.activeFocus ? root.colors.peach : root.colors.surface1
+                    border.width: 1
+                  }
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // 比对按钮
+                Rectangle {
+                  height: Style.space(24)
+                  width: mrApplyText.implicitWidth + Style.space(12)
+                  radius: Style.space(3)
+                  color: mrApplyArea.containsMouse ? root.colors.peach : root.colors.surface2
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  MouseArea {
+                    id: mrApplyArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.refreshGitStatus(false)
+                  }
+
+                  Text {
+                    id: mrApplyText
+                    anchors.centerIn: parent
+                    text: "比对"
+                    color: mrApplyArea.containsMouse ? root.colors.crust : root.colors.text
+                    font.pixelSize: Style.font.caption * 0.85
+                    font.bold: true
+                  }
+                }
+
+                // 快捷主干候选切换标签
+                Row {
+                  spacing: Style.space(4)
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Repeater {
+                    model: ["release-20260921", "master", "main"]
+                    delegate: Rectangle {
+                      required property var modelData
+                      required property int index
+
+                      visible: Boolean(modelData !== root.inputTrunkBranch)
+                      height: Style.space(20)
+                      width: chipText.implicitWidth + Style.space(8)
+                      radius: Style.space(3)
+                      color: chipArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                      MouseArea {
+                        id: chipArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          root.inputTrunkBranch = modelData
+                          root.refreshGitStatus(false)
+                        }
+                      }
+
+                      Text {
+                        id: chipText
+                        anchors.centerIn: parent
+                        text: modelData
+                        color: root.colors.subtext0
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.caption * 0.75
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // 2. 状态概要卡片
+          Rectangle {
+            width: parent.width
+            height: Style.space(48)
+            radius: Style.space(6)
+            color: root.colors.surface0
+            border.color: (root.gitUnmergedCount > 0) ? root.colors.peach : root.colors.green
+            border.width: 1
+
+            Row {
+              anchors.fill: parent
+              anchors.margins: Style.space(10)
+              spacing: Style.space(10)
+
+              Rectangle {
+                width: Style.space(28)
+                height: Style.space(28)
+                radius: Style.space(4)
+                color: (root.gitUnmergedCount > 0) ? Qt.rgba(250/255, 179/255, 135/255, 0.18) : Qt.rgba(166/255, 227/255, 161/255, 0.18)
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  anchors.centerIn: parent
+                  text: (root.gitUnmergedCount > 0) ? "\uf126" : "\uf00c"
+                  color: (root.gitUnmergedCount > 0) ? root.colors.peach : root.colors.green
+                  font.family: "JetBrainsMono Nerd Font, monospace"
+                  font.pixelSize: Style.font.body
+                }
+              }
+
+              Column {
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  text: (root.gitUnmergedCount > 0)
+                    ? ("共 " + root.gitUnmergedCount + " 个仓库有未合入主干 [" + (root.trunkBranch || "trunk") + "] 的代码")
+                    : ("太棒了！主仓及所有子仓均已合并到主干分支 [" + (root.trunkBranch || "trunk") + "]")
+                  color: root.colors.text
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+
+                Text {
+                  text: (root.gitUnmergedCount > 0)
+                    ? "基于主干分支拉取的开发分支代码尚未合并，请在上线前及时提交 MR，避免漏提。"
+                    : "所有分支修改均已顺利合入主干，无遗漏的 Merge Request。"
+                  color: root.colors.subtext0
+                  font.pixelSize: Style.font.caption * 0.85
+                }
+              }
+            }
+          }
+
+          // 3. 待提 MR 仓库清单 (每个仓库独立卡片)
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.gitMrUnmergedList.length > 0
+
+            Repeater {
+              model: root.gitMrUnmergedList
+              delegate: Rectangle {
+                id: mrRepoCard
+                required property var modelData
+                required property int index
+
+                width: parent.width
+                implicitHeight: mrRepoCardCol.implicitHeight + Style.space(16)
+                radius: Style.space(6)
+                color: root.colors.mantle
+                border.color: root.colors.peach
+                border.width: 1
+
+                Column {
+                  id: mrRepoCardCol
+                  anchors.fill: parent
+                  anchors.margins: Style.space(10)
+                  spacing: Style.space(8)
+
+                  // 第一行：仓库标识、待合入提交徽章与操作按钮
+                  Item {
+                    width: parent.width
+                    height: Style.space(26)
+
+                    Row {
+                      anchors.left: parent.left
+                      anchors.right: mrCardActionsRow.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(8)
+
+                      // 仓库类型标签 (壳工程 vs 子仓)
+                      Rectangle {
+                        height: Style.space(20)
+                        width: repoTypeTagText.implicitWidth + Style.space(10)
+                        radius: Style.space(3)
+                        color: modelData.is_shell ? Qt.rgba(137/255, 180/255, 250/255, 0.2) : Qt.rgba(249/255, 226/255, 175/255, 0.2)
+                        border.color: modelData.is_shell ? root.colors.blue : root.colors.yellow
+                        border.width: 1
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Text {
+                          id: repoTypeTagText
+                          anchors.centerIn: parent
+                          text: modelData.is_shell ? "壳工程" : "子仓"
+                          color: modelData.is_shell ? root.colors.blue : root.colors.yellow
+                          font.pixelSize: Style.font.caption * 0.8
+                          font.bold: true
+                        }
+                      }
+
+                      // 仓库名称
+                      Text {
+                        text: modelData.name
+                        color: root.colors.text
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                        elide: Text.ElideRight
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      // 未合入提交数徽章
+                      Rectangle {
+                        height: Style.space(20)
+                        width: unmergedBadgeText.implicitWidth + Style.space(10)
+                        radius: Style.space(3)
+                        color: Qt.rgba(250/255, 179/255, 135/255, 0.2)
+                        border.color: root.colors.peach
+                        border.width: 1
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Text {
+                          id: unmergedBadgeText
+                          anchors.centerIn: parent
+                          text: modelData.unmerged_count > 0 ? (modelData.unmerged_count + " 个待合提交") : "分支待合入"
+                          color: root.colors.peach
+                          font.pixelSize: Style.font.caption * 0.8
+                          font.bold: true
+                        }
+                      }
+                    }
+
+                    // 右侧操作：复制分支名 + 终端打开
+                    Row {
+                      id: mrCardActionsRow
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+
+                      // 复制分支名按钮
+                      Rectangle {
+                        height: Style.space(22)
+                        width: copyBranchBtnRow.implicitWidth + Style.space(12)
+                        radius: Style.space(3)
+                        color: copyBranchArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                        MouseArea {
+                          id: copyBranchArea
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.copyBranchName(modelData.branch)
+                        }
+
+                        Row {
+                          id: copyBranchBtnRow
+                          anchors.centerIn: parent
+                          spacing: Style.space(4)
+                          Text {
+                            text: (root.copyFeedback.indexOf(modelData.branch) !== -1) ? "\uf00c" : "\uf0c5"
+                            color: (root.copyFeedback.indexOf(modelData.branch) !== -1) ? root.colors.green : root.colors.subtext0
+                            font.family: "JetBrainsMono Nerd Font, monospace"
+                            font.pixelSize: Style.font.caption * 0.75
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                          Text {
+                            text: (root.copyFeedback.indexOf(modelData.branch) !== -1) ? "已复制!" : "复制分支名"
+                            color: (root.copyFeedback.indexOf(modelData.branch) !== -1) ? root.colors.green : root.colors.text
+                            font.pixelSize: Style.font.caption * 0.75
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                        }
+                      }
+
+                      // 终端打开
+                      Rectangle {
+                        height: Style.space(22)
+                        width: mrTermBtnRow.implicitWidth + Style.space(12)
+                        radius: Style.space(3)
+                        color: mrTermArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                        MouseArea {
+                          id: mrTermArea
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: {
+                            var p = modelData.path
+                            var t = root.trunkBranch || "master"
+                            Quickshell.execDetached([
+                              "sh", "-c",
+                              "command -v omarchy-launch-terminal >/dev/null && omarchy-launch-terminal bash -c \x27cd \x22" + p + "\x22 && echo \x22=== " + modelData.name + " 未合入 " + t + " 的提交 ===\x22 && git log origin/" + t + "..HEAD --oneline -n 20 2>/dev/null || git log " + t + "..HEAD --oneline -n 20; echo; git status; echo; read -p \x22按回车键退出...\x22\x27 || xdg-terminal-exec bash -c \x27cd \x22" + p + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27"
+                            ])
+                          }
+                        }
+
+                        Row {
+                          id: mrTermBtnRow
+                          anchors.centerIn: parent
+                          spacing: Style.space(4)
+                          Text {
+                            text: "\uf120"
+                            color: root.colors.subtext0
+                            font.family: "JetBrainsMono Nerd Font, monospace"
+                            font.pixelSize: Style.font.caption * 0.75
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                          Text {
+                            text: "终端查看"
+                            color: root.colors.text
+                            font.pixelSize: Style.font.caption * 0.75
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  // 第二行：分支流向与状态徽章
+                  Flow {
+                    width: parent.width
+                    spacing: Style.space(6)
+
+                    // 分支流向徽章 (feat/xxx -> trunk)
+                    Rectangle {
+                      height: Style.space(22)
+                      width: branchFlowRow.implicitWidth + Style.space(12)
+                      radius: Style.space(3)
+                      color: root.colors.surface0
+                      border.color: root.colors.surface1
+                      border.width: 1
+
+                      Row {
+                        id: branchFlowRow
+                        anchors.centerIn: parent
+                        spacing: Style.space(6)
+
+                        Text {
+                          text: "\ue725"
+                          color: root.colors.blue
+                          font.family: "JetBrainsMono Nerd Font, monospace"
+                          font.pixelSize: Style.font.caption * 0.8
+                          anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        Text {
+                          text: modelData.branch
+                          color: root.colors.text
+                          font.family: "JetBrainsMono Nerd Font, monospace"
+                          font.pixelSize: Style.font.caption * 0.85
+                          font.bold: true
+                          anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        Text {
+                          text: "➔"
+                          color: root.colors.peach
+                          font.pixelSize: Style.font.caption * 0.85
+                          anchors.verticalCenter: parent.verticalCenter
+                        }
+
+                        Text {
+                          text: root.trunkBranch || "trunk"
+                          color: root.colors.peach
+                          font.family: "JetBrainsMono Nerd Font, monospace"
+                          font.pixelSize: Style.font.caption * 0.85
+                          font.bold: true
+                          anchors.verticalCenter: parent.verticalCenter
+                        }
+                      }
+                    }
+
+                    // 待 push 徽章
+                    Rectangle {
+                      visible: Boolean(modelData.ahead > 0)
+                      height: Style.space(22)
+                      width: mrAheadText.implicitWidth + Style.space(10)
+                      radius: Style.space(3)
+                      color: Qt.rgba(137/255, 180/255, 250/255, 0.15)
+                      border.color: root.colors.blue
+                      border.width: 1
+
+                      Text {
+                        id: mrAheadText
+                        anchors.centerIn: parent
+                        text: "↑ 待 push " + (modelData.ahead || 0)
+                        color: root.colors.blue
+                        font.pixelSize: Style.font.caption * 0.8
+                      }
+                    }
+
+                    // 未提交改动徽章
+                    Rectangle {
+                      visible: Boolean(modelData.dirty)
+                      height: Style.space(22)
+                      width: mrDirtyText.implicitWidth + Style.space(10)
+                      radius: Style.space(3)
+                      color: Qt.rgba(249/255, 226/255, 175/255, 0.15)
+                      border.color: root.colors.yellow
+                      border.width: 1
+
+                      Text {
+                        id: mrDirtyText
+                        anchors.centerIn: parent
+                        text: "! 有未提交变更"
+                        color: root.colors.yellow
+                        font.pixelSize: Style.font.caption * 0.8
+                      }
+                    }
+                  }
+
+                  // 第三行：提交列表 (直接展示需要合入的 commits)
+                  Column {
+                    width: parent.width
+                    spacing: Style.space(4)
+                    visible: Boolean(modelData.commits && modelData.commits.length > 0)
+
+                    Repeater {
+                      model: modelData.commits || []
+                      delegate: Rectangle {
+                        required property var modelData
+                        required property int index
+
+                        width: parent.width
+                        height: Style.space(24)
+                        radius: Style.space(3)
+                        color: mrCommitRowArea.containsMouse ? root.colors.surface1 : root.colors.surface0
+
+                        MouseArea {
+                          id: mrCommitRowArea
+                          anchors.fill: parent
+                          hoverEnabled: true
+                        }
+
+                        Row {
+                          anchors.fill: parent
+                          anchors.leftMargin: Style.space(8)
+                          anchors.rightMargin: Style.space(8)
+                          spacing: Style.space(6)
+
+                          Text {
+                            text: "•"
+                            color: root.colors.peach
+                            font.pixelSize: Style.font.caption
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+
+                          Text {
+                            id: commitHashText
+                            text: {
+                              var idx = modelData.indexOf(" ")
+                              return idx > 0 ? modelData.substring(0, idx) : modelData
+                            }
+                            color: root.colors.peach
+                            font.family: "JetBrainsMono Nerd Font, monospace"
+                            font.pixelSize: Style.font.caption * 0.85
+                            font.bold: true
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+
+                          Text {
+                            text: {
+                              var idx = modelData.indexOf(" ")
+                              return idx > 0 ? modelData.substring(idx + 1) : ""
+                            }
+                            color: root.colors.text
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.caption * 0.85
+                            elide: Text.ElideRight
+                            width: Math.max(10, parent.width - commitHashText.implicitWidth - Style.space(32))
+                            anchors.verticalCenter: parent.verticalCenter
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // 4. 已合入主干的开发分支仓库 (可折叠展示)
+          Rectangle {
+            visible: root.gitMrMergedList.length > 0
+            width: parent.width
+            implicitHeight: mrMergedCol.implicitHeight + Style.space(12)
+            radius: Style.space(6)
+            color: root.colors.mantle
+            border.color: root.colors.surface1
+            border.width: 1
+
+            property bool isExpanded: false
+
+            Column {
+              id: mrMergedCol
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              spacing: Style.space(6)
+
+              Item {
+                width: parent.width
+                height: Style.space(24)
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: parent.parent.parent.isExpanded = !parent.parent.parent.isExpanded
+                }
+
+                Row {
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(6)
+
+                  Text {
+                    text: parent.parent.parent.parent.isExpanded ? "\uf078" : "\uf054"
+                    color: root.colors.green
+                    font.family: "JetBrainsMono Nerd Font, monospace"
+                    font.pixelSize: Style.font.caption * 0.8
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+
+                  Text {
+                    text: "已合并到主干的子分支仓库 (" + root.gitMrMergedList.length + " 个)"
+                    color: root.colors.subtext0
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                Text {
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: parent.parent.parent.parent.isExpanded ? "收起 ▲" : "展开查看已合入仓库 ▼"
+                  color: root.colors.overlay0
+                  font.pixelSize: Style.font.caption * 0.8
+                }
+              }
+
+              Flow {
+                visible: parent.parent.isExpanded
+                width: parent.width
+                spacing: Style.space(4)
+
+                Repeater {
+                  model: root.gitMrMergedList
+                  delegate: Rectangle {
+                    required property var modelData
+                    required property int index
+
+                    height: Style.space(22)
+                    width: mergedChipRow.implicitWidth + Style.space(10)
+                    radius: Style.space(3)
+                    color: root.colors.surface0
+
+                    Row {
+                      id: mergedChipRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+
+                      Text {
+                        text: "✓"
+                        color: root.colors.green
+                        font.pixelSize: Style.font.caption * 0.75
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        text: modelData.name
+                        color: root.colors.text
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.caption * 0.8
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        text: "(" + modelData.branch + ")"
+                        color: root.colors.subtext0
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.caption * 0.75
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // 5. 底部说明栏
+          Rectangle {
+            width: parent.width
+            height: Style.space(30)
+            radius: Style.space(4)
+            color: "transparent"
+
+            Text {
+              anchors.centerIn: parent
+              text: "其余 " + (root.gitLibsTotal + 1 - root.gitMrUnmergedList.length - root.gitMrMergedList.length) + " 个仓库直接处于主干分支 [" + (root.trunkBranch || "trunk") + "]，无需提 MR"
+              color: root.colors.overlay0
+              font.pixelSize: Style.font.caption * 0.8
+            }
+          }
+        } // 关闭 mrViewCol
         }
       }
     }

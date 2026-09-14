@@ -17,6 +17,11 @@
   - 🖥️ **Mac 连通性**：毫秒级 SSH 状态监测与状态灯。
   - 📱 **USB 真机检测**：本地 `hdc` 连接状态与在线设备识别。
   - 📁 **本地工程识别**：实时识别当前工程名称与 `bundleName`。
+- **主仓与子仓待提 MR / 未合并主干智能检测**：
+  - **全量感知**：一网打尽主仓（壳工程）及几十个依赖子仓（`libs_source`）的开发子分支。
+  - **精准比对**：自动识别迭代主干基线（如 `release-20260921`、`master` 等），支持自定义与快速切换比对目标。
+  - **防漏提提醒**：在状态栏 Tooltip、主面板及 Git 面板多级高亮展示未合入主干的提交清单、分支流向及待提 MR 仓库数。
+  - **一键辅助**：支持一键复制分支名、一键终端查看提交差异与状态。
 - **一键快捷操作矩阵**：
   - 🚀 **一键全流程**：增量同步 -> Mac 原生满速构建 -> 回传产物 -> 本地 USB 真机安装 -> 自动拉起 App。
   - 🔨 **仅远程构建**：完成构建并拉取 HAP 安装包，不执行真机安装。
@@ -83,6 +88,7 @@ omarchy plugin validate .
   "macHost": "chenbolun@10.221.68.124",
   "remoteDir": "~/Dev/harmony",
   "projectPath": "/home/zhouatie/Work/harmony/CloudMusicHarmony",
+  "trunkBranch": "release-20260921",
   "autoInstall": true,
   "autoLaunch": true
 }
@@ -91,6 +97,7 @@ omarchy plugin validate .
 - **macHost**：远程编译机 SSH 地址。
 - **remoteDir**：Mac 远程基础目录，每个工程会自动归纳在 `<remoteDir>/<工程名>` 下，互不冲突。
 - **projectPath**：本地工程根目录（包含 `build-profile.json5`）。留空时将按当前打开的终端目录自动向上探测。
+- **trunkBranch**：比对的目标主干分支名称（如 `release-20260921` 或 `master`）。留空时智能自动探测工程基线。
 - **autoInstall**：是否在构建完成后通过 USB 自动安装到真机。
 - **autoLaunch**：是否在安装完成后通过 HDC 自动拉起 `EntryAbility`。
 
@@ -105,6 +112,7 @@ omarchy-shell harmony.dev open      # 打开控制面板
 omarchy-shell harmony.dev close     # 关闭控制面板
 omarchy-shell harmony.dev toggle    # 切换打开/关闭
 omarchy-shell harmony.dev refresh   # 刷新当前环境与设备
+omarchy-shell harmony.dev mr        # 打开未合主干 (MR) 清单面板
 omarchy-shell harmony.dev build     # 直接触发全流程构建
 omarchy-shell harmony.dev sync      # 触发增量同步
 omarchy-shell harmony.dev install   # 触发真机安装
