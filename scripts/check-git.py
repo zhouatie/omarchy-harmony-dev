@@ -18,6 +18,8 @@ def parse_args():
     parser.add_argument("--path", type=str, default="", help="Project root directory")
     parser.add_argument("--fetch", action="store_true", help="Fetch remote refs before checking")
     parser.add_argument("--trunk", type=str, default="", help="Target trunk branch for MR comparison")
+    parser.add_argument("--pull", action="store_true", help="Pull latest for repos that are behind remote (--ff-only)")
+    parser.add_argument("--pull-repo", type=str, default="", help="Pull specific repo by name or path (--ff-only)")
     return parser.parse_args()
 
 def resolve_trunk_branch(proj_path, specified_trunk):
@@ -239,6 +241,24 @@ def check_single_repo(repo_path, do_fetch=False, trunk_branch=""):
     except Exception as e:
         return {"error": str(e)}
 
+def pull_single_repo(repo_path, name=""):
+    repo_name = name or os.path.basename(repo_path)
+    git_dir = os.path.join(repo_path, ".git")
+    if not os.path.exists(git_dir):
+        return {"name": repo_name, "path": repo_path, "ok": False, "msg": "非 Git 仓库"}
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_path, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=25
+        )
+        ok = (res.returncode == 0)
+        msg = res.stdout.strip() if ok else (res.stderr.strip() or res.stdout.strip())
+        return {"name": repo_name, "path": repo_path, "ok": ok, "msg": msg}
+    except subprocess.TimeoutExpired:
+        return {"name": repo_name, "path": repo_path, "ok": False, "msg": "拉取超时 (25s)"}
+    except Exception as e:
+        return {"name": repo_name, "path": repo_path, "ok": False, "msg": str(e)}
+
 def main():
     args = parse_args()
     proj_path = resolve_project_path(args.path)
@@ -252,14 +272,7 @@ def main():
 
     trunk_branch = resolve_trunk_branch(proj_path, args.trunk)
 
-    # 1. Shell Repo
-    shell_info = check_single_repo(proj_path, do_fetch=args.fetch, trunk_branch=trunk_branch)
-    if not shell_info or shell_info.get("error"):
-        shell_info = {"is_git": False}
-    else:
-        shell_info["is_git"] = True
-
-    # 2. Sub-libraries (libs_source / lib_source)
+    # Sub-libraries (libs_source / lib_source)
     target_lib_dir = ""
     dir_name = ""
     for candidate in ["libs_source", "lib_source"]:
@@ -268,6 +281,61 @@ def main():
             target_lib_dir = p
             dir_name = candidate
             break
+
+    subdirs = []
+    if target_lib_dir:
+        try:
+            for entry in sorted(os.listdir(target_lib_dir)):
+                full_p = os.path.join(target_lib_dir, entry)
+                if os.path.isdir(full_p) and os.path.exists(os.path.join(full_p, ".git")):
+                    subdirs.append((entry, full_p))
+        except Exception:
+            pass
+
+    # Execute pull if requested
+    pull_results = []
+    if args.pull_repo:
+        target_name = args.pull_repo.strip()
+        matched_path = None
+        matched_name = target_name
+        if target_name.lower() in ["shell", os.path.basename(proj_path).lower(), proj_path.lower()]:
+            matched_path = proj_path
+            matched_name = os.path.basename(proj_path)
+        elif target_lib_dir:
+            for entry, full_p in subdirs:
+                if entry == target_name or full_p == target_name:
+                    matched_path = full_p
+                    matched_name = entry
+                    break
+        if matched_path:
+            pull_results.append(pull_single_repo(matched_path, matched_name))
+        else:
+            pull_results.append({"name": target_name, "ok": False, "msg": "未找到匹配的仓库"})
+    elif args.pull:
+        repos_to_pull = []
+        sh_check = check_single_repo(proj_path, do_fetch=args.fetch, trunk_branch=trunk_branch)
+        if sh_check and sh_check.get("behind", 0) > 0:
+            repos_to_pull.append((os.path.basename(proj_path), proj_path))
+        if subdirs:
+            def scan_behind(item):
+                name, p = item
+                res = check_single_repo(p, do_fetch=args.fetch, trunk_branch=trunk_branch)
+                if res and res.get("behind", 0) > 0:
+                    return (name, p)
+                return None
+            with ThreadPoolExecutor(max_workers=24) as scan_exec:
+                repos_to_pull.extend(filter(None, scan_exec.map(scan_behind, subdirs)))
+        if repos_to_pull:
+            with ThreadPoolExecutor(max_workers=8) as pull_exec:
+                pull_results = list(pull_exec.map(lambda it: pull_single_repo(it[1], it[0]), repos_to_pull))
+
+    # 1. Shell Repo
+    post_fetch = args.fetch if not (args.pull or args.pull_repo) else False
+    shell_info = check_single_repo(proj_path, do_fetch=post_fetch, trunk_branch=trunk_branch)
+    if not shell_info or shell_info.get("error"):
+        shell_info = {"is_git": False}
+    else:
+        shell_info["is_git"] = True
 
     libs_info = {
         "exists": False,
@@ -307,20 +375,11 @@ def main():
 
     if target_lib_dir:
         libs_info["exists"] = True
-        subdirs = []
-        try:
-            for entry in sorted(os.listdir(target_lib_dir)):
-                full_p = os.path.join(target_lib_dir, entry)
-                if os.path.isdir(full_p) and os.path.exists(os.path.join(full_p, ".git")):
-                    subdirs.append((entry, full_p))
-        except Exception:
-            pass
-
         libs_info["total"] = len(subdirs)
 
         def worker(item):
             name, path = item
-            res = check_single_repo(path, do_fetch=args.fetch, trunk_branch=trunk_branch)
+            res = check_single_repo(path, do_fetch=post_fetch, trunk_branch=trunk_branch)
             if res and not res.get("error"):
                 res["name"] = name
                 res["path"] = path
@@ -410,7 +469,8 @@ def main():
         "trunk_branch": trunk_branch,
         "shell": shell_info,
         "libs": libs_info,
-        "mr_summary": mr_summary
+        "mr_summary": mr_summary,
+        "pull_results": pull_results
     }
     print(json.dumps(output, ensure_ascii=False))
 

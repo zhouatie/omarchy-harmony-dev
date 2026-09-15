@@ -52,6 +52,35 @@ BarWidget {
   property string buildStage: ""
   property var buildLogs: []
   property int buildElapsedSeconds: 0
+  property string logFeedback: ""
+  property int buildErrorCount: 0
+  readonly property string errorParserScriptPath: pluginDir + "/scripts/parse-build-errors.py"
+
+  Timer {
+    id: logFeedbackTimer
+    interval: 2500
+    repeat: false
+    onTriggered: root.logFeedback = ""
+  }
+
+  function copyLastErrorForAi() {
+    root.logFeedback = "已复制报错报告 (可直接发给 AI) ✓"
+    logFeedbackTimer.restart()
+    Quickshell.execDetached([
+      "sh", "-c",
+      "python3 \"" + root.errorParserScriptPath + "\" --copy 2>/dev/null || (cat \"$HOME/.cache/harmony/last-error.log\" 2>/dev/null | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null))"
+    ])
+  }
+
+  function copyAllLogs() {
+    root.logFeedback = "已复制当前日志 ✓"
+    logFeedbackTimer.restart()
+    var text = root.buildLogs.join("\n")
+    Quickshell.execDetached([
+      "sh", "-c",
+      "printf '%s' " + JSON.stringify(text) + " | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null)"
+    ])
+  }
 
   // 环境检测状态
   property bool sshOk: false
@@ -65,6 +94,9 @@ BarWidget {
 
   // Git 状态属性
   property bool gitChecking: false
+  property bool gitPulling: false
+  property string pullingRepoName: ""
+  property string gitFeedback: ""
   property bool gitOk: false
   property string gitShellBranch: ""
   property bool gitShellClean: true
@@ -178,6 +210,8 @@ BarWidget {
     function build(): void { root.startBuild("all") }
     function sync(): void { root.startBuild("sync-only") }
     function install(): void { root.startBuild("install-only") }
+    function copyError(): void { root.copyLastErrorForAi() }
+    function copyLog(): void { root.copyAllLogs() }
   }
 
   // 构建计时器
@@ -208,16 +242,32 @@ BarWidget {
     onTriggered: root.saveFeedback = ""
   }
 
+  // Git 操作提示倒计时
+  Timer {
+    id: gitFeedbackTimer
+    interval: 3500
+    repeat: false
+    onTriggered: root.gitFeedback = ""
+  }
+
   // 追加日志
   function appendLog(line) {
     if (!line) return
-    var clean = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    var clean = line.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\r/g, "").trim()
+    if (!clean) return
+
+    // 过滤掉淹没真正报错的高频冗余插件消息
+    if (clean.indexOf("Save generated file is true, skip deleting temporary files") !== -1) return
+
     if (clean.indexOf("===>") !== -1) {
       root.buildStage = clean.replace(/={3,}>\s*/, "").trim()
     }
+    if (clean.indexOf("ArkTS Compiler Error") !== -1 || clean.indexOf("COMPILE RESULT:FAIL") !== -1 || clean.indexOf("BUILD FAILED") !== -1) {
+      root.buildErrorCount += 1
+    }
     var logs = root.buildLogs.slice()
     logs.push(clean)
-    if (logs.length > 300) logs.shift()
+    if (logs.length > 1200) logs.shift()
     root.buildLogs = logs
   }
 
@@ -270,6 +320,29 @@ BarWidget {
     gitStatusProc.running = true
   }
 
+  // 拉取更新 (repoName 为空时批量拉取所有落后仓库，非空时拉取指定仓库)
+  function pullGitRepos(repoName) {
+    if (gitStatusProc.running) return
+    root.gitChecking = true
+    root.gitPulling = true
+    root.pullingRepoName = repoName || ""
+    var args = [root.gitScriptPath]
+    var path = root.inputProjectPath || root.projectPath
+    if (path) {
+      args.push("--path", path)
+    }
+    if (root.inputTrunkBranch) {
+      args.push("--trunk", root.inputTrunkBranch)
+    }
+    if (repoName) {
+      args.push("--pull-repo", repoName)
+    } else {
+      args.push("--pull")
+    }
+    gitStatusProc.command = args
+    gitStatusProc.running = true
+  }
+
   // 启动构建流程
   function startBuild(mode) {
     if (root.building) return
@@ -277,6 +350,8 @@ BarWidget {
     root.buildElapsedSeconds = 0
     root.buildStage = "正在初始化..."
     root.buildStatus = "构建中..."
+    root.buildErrorCount = 0
+    root.logFeedback = ""
     root.buildLogs = ["[" + new Date().toLocaleTimeString() + "] 开始执行模式: " + mode]
 
     var args = [root.buildScriptPath]
@@ -430,6 +505,10 @@ BarWidget {
     }
     onExited: function(code) {
       root.gitChecking = false
+      var wasPulling = root.gitPulling
+      var pulledTarget = root.pullingRepoName
+      root.gitPulling = false
+      root.pullingRepoName = ""
       if (code !== 0) return
       var text = gitStatusCollector.text.trim()
       if (!text) return
@@ -437,6 +516,26 @@ BarWidget {
         var res = JSON.parse(text)
         root.gitOk = (res.ok === true)
         if (res.ok) {
+          if (wasPulling && res.pull_results && res.pull_results.length > 0) {
+            var successCount = 0
+            var failCount = 0
+            for (var i = 0; i < res.pull_results.length; i++) {
+              if (res.pull_results[i].ok) successCount++
+              else failCount++
+            }
+            var msg = ""
+            if (failCount === 0) {
+              msg = successCount === 1 ? "已拉取最新 ✓" : ("已拉取 " + successCount + " 仓 ✓")
+            } else {
+              msg = successCount + " 成功，" + failCount + " 失败"
+            }
+            root.gitFeedback = msg
+            gitFeedbackTimer.restart()
+            Quickshell.execDetached([
+              "sh", "-c",
+              "command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g '\uf126' 'Git' '" + msg + "' || true"
+            ])
+          }
           if (res.trunk_branch) {
             root.trunkBranch = res.trunk_branch
             if (!root.inputTrunkBranch) {
@@ -1737,9 +1836,87 @@ BarWidget {
             width: parent.width
             spacing: Style.space(6)
 
+            // 构建失败高亮诊断条 (带有一键复制报错给 AI)
+            Rectangle {
+              visible: root.buildStatus === "失败"
+              width: parent.width
+              height: Style.space(34)
+              radius: Style.space(6)
+              color: Qt.rgba(243/255, 139/255, 168/255, 0.12)
+              border.color: root.colors.red
+              border.width: 1
+
+              Row {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(10)
+                spacing: Style.space(8)
+
+                Text {
+                  text: "\uf06a"
+                  color: root.colors.red
+                  font.family: "JetBrainsMono Nerd Font, monospace"
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  text: "构建未通过！已提取编译错误与排查信息"
+                  color: root.colors.red
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Item {
+                  width: Style.space(1)
+                  height: Style.space(1)
+                }
+
+                Rectangle {
+                  height: Style.space(24)
+                  width: aiBannerBtnRow.implicitWidth + Style.space(14)
+                  radius: Style.space(4)
+                  color: aiBannerArea.containsMouse ? root.colors.red : root.colors.surface1
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  MouseArea {
+                    id: aiBannerArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.copyLastErrorForAi()
+                  }
+
+                  Row {
+                    id: aiBannerBtnRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(4)
+
+                    Text {
+                      text: "\uf0c5"
+                      color: aiBannerArea.containsMouse ? root.colors.crust : root.colors.text
+                      font.family: "JetBrainsMono Nerd Font, monospace"
+                      font.pixelSize: Style.font.caption * 0.85
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      text: "复制报错给 AI"
+                      color: aiBannerArea.containsMouse ? root.colors.crust : root.colors.text
+                      font.pixelSize: Style.font.caption * 0.85
+                      font.bold: true
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+              }
+            }
+
             Item {
               width: parent.width
-              height: Style.space(20)
+              height: Style.space(22)
 
               Row {
                 anchors.left: parent.left
@@ -1750,15 +1927,15 @@ BarWidget {
 
                 Text {
                   text: "\uf120"
-                  color: root.colors.subtext0
+                  color: root.logFeedback ? root.colors.green : root.colors.subtext0
                   font.family: "JetBrainsMono Nerd Font, monospace"
                   font.pixelSize: Style.font.caption
                   anchors.verticalCenter: parent.verticalCenter
                 }
 
                 Text {
-                  text: "构建日志" + (root.buildStage ? (" — " + root.buildStage) : "")
-                  color: root.colors.subtext1
+                  text: root.logFeedback ? root.logFeedback : ("构建日志" + (root.buildStage ? (" — " + root.buildStage) : ""))
+                  color: root.logFeedback ? root.colors.green : root.colors.subtext1
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                   font.bold: true
@@ -1773,18 +1950,23 @@ BarWidget {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(6)
 
+                // 复制报错 (AI)
                 Rectangle {
-                  width: Style.space(68)
+                  width: Style.space(96)
                   height: Style.space(22)
                   radius: Style.space(3)
-                  color: clearLogArea.containsMouse ? root.colors.surface2 : root.colors.surface0
+                  color: copyAiArea.containsMouse
+                    ? (root.buildStatus === "失败" ? root.colors.red : root.colors.surface2)
+                    : (root.buildStatus === "失败" ? Qt.rgba(243/255, 139/255, 168/255, 0.22) : root.colors.surface0)
+                  border.color: root.buildStatus === "失败" ? root.colors.red : root.colors.surface1
+                  border.width: 1
 
                   MouseArea {
-                    id: clearLogArea
+                    id: copyAiArea
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.buildLogs = []
+                    onClicked: root.copyLastErrorForAi()
                   }
 
                   Row {
@@ -1792,7 +1974,48 @@ BarWidget {
                     spacing: Style.space(4)
 
                     Text {
-                      text: "\uf1f8"
+                      text: "\uf0c5"
+                      color: copyAiArea.containsMouse
+                        ? (root.buildStatus === "失败" ? root.colors.crust : root.colors.text)
+                        : (root.buildStatus === "失败" ? root.colors.red : root.colors.subtext0)
+                      font.family: "JetBrainsMono Nerd Font, monospace"
+                      font.pixelSize: Style.font.caption * 0.85
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      text: "复制报错(AI)"
+                      color: copyAiArea.containsMouse
+                        ? (root.buildStatus === "失败" ? root.colors.crust : root.colors.text)
+                        : (root.buildStatus === "失败" ? root.colors.red : root.colors.subtext0)
+                      font.pixelSize: Style.font.caption * 0.85
+                      font.bold: root.buildStatus === "失败"
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+
+                // 复制日志
+                Rectangle {
+                  width: Style.space(68)
+                  height: Style.space(22)
+                  radius: Style.space(3)
+                  color: copyLogArea.containsMouse ? root.colors.surface2 : root.colors.surface0
+
+                  MouseArea {
+                    id: copyLogArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.copyAllLogs()
+                  }
+
+                  Row {
+                    anchors.centerIn: parent
+                    spacing: Style.space(4)
+
+                    Text {
+                      text: "\uf0ea"
                       color: root.colors.subtext0
                       font.family: "JetBrainsMono Nerd Font, monospace"
                       font.pixelSize: Style.font.caption * 0.85
@@ -1800,7 +2023,7 @@ BarWidget {
                     }
 
                     Text {
-                      text: "清空"
+                      text: "复制日志"
                       color: root.colors.subtext0
                       font.pixelSize: Style.font.caption * 0.85
                       anchors.verticalCenter: parent.verticalCenter
@@ -1808,8 +2031,9 @@ BarWidget {
                   }
                 }
 
+                // 完整日志
                 Rectangle {
-                  width: Style.space(88)
+                  width: Style.space(78)
                   height: Style.space(22)
                   radius: Style.space(3)
                   color: openLogArea.containsMouse ? root.colors.surface2 : root.colors.surface0
@@ -1847,61 +2071,6 @@ BarWidget {
                     }
                   }
                 }
-              }
-            }
-
-            // 日志框
-            Rectangle {
-              width: parent.width
-              height: Style.space(180)
-              radius: Style.space(6)
-              color: root.colors.crust
-              border.color: root.colors.surface0
-              border.width: 1
-              clip: true
-
-              ListView {
-                id: logListView
-                anchors.fill: parent
-                anchors.margins: Style.space(6)
-                clip: true
-                model: root.buildLogs
-                spacing: Style.space(2)
-                boundsBehavior: Flickable.StopAtBounds
-
-                ScrollBar.vertical: ScrollBar {
-                  policy: ScrollBar.AsNeeded
-                }
-
-                delegate: Text {
-                  width: logListView.width
-                  text: modelData
-                  color: {
-                    if (modelData.indexOf("[ERROR]") !== -1 || modelData.indexOf("失败") !== -1) return root.colors.red
-                    if (modelData.indexOf("[WARN]") !== -1) return root.colors.yellow
-                    if (modelData.indexOf("===>") !== -1 || modelData.indexOf("[INFO]") !== -1) return root.colors.blue
-                    if (modelData.indexOf("[SUCCESS]") !== -1 || modelData.indexOf("成功") !== -1) return root.colors.green
-                    return root.colors.subtext0
-                  }
-                  font.family: "JetBrainsMono Nerd Font, monospace"
-                  font.pixelSize: Style.font.caption * 0.85
-                  wrapMode: Text.WrapAnywhere
-                }
-
-                onCountChanged: {
-                  Qt.callLater(function() {
-                    logListView.positionViewAtEnd()
-                  })
-                }
-              }
-
-              // 空日志提示
-              Text {
-                visible: root.buildLogs.length === 0
-                anchors.centerIn: parent
-                text: "暂无构建日志，点击上方按钮开始构建"
-                color: root.colors.overlay0
-                font.pixelSize: Style.font.caption
               }
             }
           }
@@ -2022,12 +2191,22 @@ BarWidget {
                 }
               }
 
-              // 右侧：检查远端 (Fetch) 与 刷新
+              // 右侧：检查远端 (Fetch)、批量拉取 与 刷新
               Row {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(6)
 
+                // 提示信息
+                Text {
+                  visible: root.gitFeedback !== ""
+                  text: root.gitFeedback
+                  color: root.colors.green
+                  font.pixelSize: Style.font.caption * 0.85
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // 检查远端
                 Rectangle {
                   height: Style.space(26)
                   width: gitViewFetchText.implicitWidth + Style.space(14)
@@ -2055,7 +2234,46 @@ BarWidget {
                     }
                     Text {
                       id: gitViewFetchText
-                      text: "检查远端更新 (Fetch)"
+                      text: "检查远端"
+                      color: root.colors.text
+                      font.pixelSize: Style.font.caption * 0.85
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+
+                // 批量拉取 (仅在有仓库落后时显示)
+                Rectangle {
+                  visible: (root.gitLibsBehindCount > 0 || root.gitShellBehind > 0)
+                  height: Style.space(26)
+                  width: gitViewPullText.implicitWidth + Style.space(14)
+                  radius: Style.space(4)
+                  color: gitViewPullArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                  border.color: root.colors.yellow
+                  border.width: 1
+
+                  MouseArea {
+                    id: gitViewPullArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: !root.gitChecking
+                    onClicked: root.pullGitRepos("")
+                  }
+
+                  Row {
+                    anchors.centerIn: parent
+                    spacing: Style.space(4)
+                    Text {
+                      text: "\uf019"
+                      color: root.colors.yellow
+                      font.family: "JetBrainsMono Nerd Font, monospace"
+                      font.pixelSize: Style.font.caption * 0.85
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      id: gitViewPullText
+                      text: (root.gitPulling && !root.pullingRepoName) ? "拉取中" : "批量拉取"
                       color: root.colors.text
                       font.pixelSize: Style.font.caption * 0.85
                       anchors.verticalCenter: parent.verticalCenter
@@ -2243,47 +2461,91 @@ BarWidget {
                   }
                 }
 
-                // 终端按钮
-                Rectangle {
-                  id: shellTermBtnRect
+                // 壳工程操作按钮
+                Row {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  height: Style.space(22)
-                  width: shellTermBtnRow.implicitWidth + Style.space(12)
-                  radius: Style.space(3)
-                  color: shellTermBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                  spacing: Style.space(6)
 
-                  MouseArea {
-                    id: shellTermBtnArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                      var p = root.inputProjectPath || root.projectPath
-                      if (!p) return
-                      Quickshell.execDetached([
-                        "sh", "-c",
-                        "command -v omarchy-launch-terminal >/dev/null && omarchy-launch-terminal bash -c \x27cd \x22" + p + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27 || xdg-terminal-exec bash -c \x27cd \x22" + p + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27"
-                      ])
+                  // 拉取按钮
+                  Rectangle {
+                    visible: root.gitShellBehind > 0
+                    height: Style.space(22)
+                    width: shellPullBtnRow.implicitWidth + Style.space(10)
+                    radius: Style.space(3)
+                    color: shellPullBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                    border.color: root.colors.yellow
+                    border.width: 1
+
+                    MouseArea {
+                      id: shellPullBtnArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      enabled: !root.gitChecking
+                      onClicked: root.pullGitRepos("shell")
+                    }
+
+                    Row {
+                      id: shellPullBtnRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+                      Text {
+                        text: "\uf019"
+                        color: root.colors.yellow
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.caption * 0.75
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                      Text {
+                        text: (root.gitPulling && root.pullingRepoName === "shell") ? "拉取中" : "拉取"
+                        color: root.colors.text
+                        font.pixelSize: Style.font.caption * 0.75
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
                     }
                   }
 
-                  Row {
-                    id: shellTermBtnRow
-                    anchors.centerIn: parent
-                    spacing: Style.space(4)
-                    Text {
-                      text: "\uf120"
-                      color: root.colors.subtext0
-                      font.family: "JetBrainsMono Nerd Font, monospace"
-                      font.pixelSize: Style.font.caption * 0.8
-                      anchors.verticalCenter: parent.verticalCenter
+                  // 终端按钮
+                  Rectangle {
+                    id: shellTermBtnRect
+                    height: Style.space(22)
+                    width: shellTermBtnRow.implicitWidth + Style.space(12)
+                    radius: Style.space(3)
+                    color: shellTermBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                    MouseArea {
+                      id: shellTermBtnArea
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: {
+                        var p = root.inputProjectPath || root.projectPath
+                        if (!p) return
+                        Quickshell.execDetached([
+                          "sh", "-c",
+                          "command -v omarchy-launch-terminal >/dev/null && omarchy-launch-terminal bash -c \x27cd \x22" + p + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27 || xdg-terminal-exec bash -c \x27cd \x22" + p + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27"
+                        ])
+                      }
                     }
-                    Text {
-                      text: "终端查看"
-                      color: root.colors.text
-                      font.pixelSize: Style.font.caption * 0.8
-                      anchors.verticalCenter: parent.verticalCenter
+
+                    Row {
+                      id: shellTermBtnRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(4)
+                      Text {
+                        text: "\uf120"
+                        color: root.colors.subtext0
+                        font.family: "JetBrainsMono Nerd Font, monospace"
+                        font.pixelSize: Style.font.caption * 0.8
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                      Text {
+                        text: "终端查看"
+                        color: root.colors.text
+                        font.pixelSize: Style.font.caption * 0.8
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
                     }
                   }
                 }
@@ -2520,7 +2782,7 @@ BarWidget {
 
                         MouseArea {
                           anchors.fill: parent
-                          anchors.rightMargin: openTermBtnRect.width + Style.space(12)
+                          anchors.rightMargin: subActionBtnsRow.width + Style.space(12)
                           hoverEnabled: true
                           cursorShape: Boolean(modelData.files && modelData.files.length > 0) ? Qt.PointingHandCursor : Qt.ArrowCursor
                           enabled: Boolean(modelData.files && modelData.files.length > 0)
@@ -2529,7 +2791,7 @@ BarWidget {
 
                         Row {
                           anchors.left: parent.left
-                          anchors.right: openTermBtnRect.left
+                          anchors.right: subActionBtnsRow.left
                           anchors.rightMargin: Style.space(8)
                           anchors.verticalCenter: parent.verticalCenter
                           spacing: Style.space(8)
@@ -2657,46 +2919,91 @@ BarWidget {
                           }
                         }
 
-                        // 终端打开按钮
-                        Rectangle {
-                          id: openTermBtnRect
+                        // 子仓操作按钮
+                        Row {
+                          id: subActionBtnsRow
                           anchors.right: parent.right
                           anchors.verticalCenter: parent.verticalCenter
-                          height: Style.space(20)
-                          width: openTermBtnRow.implicitWidth + Style.space(10)
-                          radius: Style.space(3)
-                          color: openTermBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                          spacing: Style.space(6)
 
-                          MouseArea {
-                            id: openTermBtnArea
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                              var fullPath = (root.inputProjectPath || root.projectPath) + "/" + (root.gitLibsDirName || "libs_source") + "/" + modelData.name
-                              Quickshell.execDetached([
-                                "sh", "-c",
-                                "command -v omarchy-launch-terminal >/dev/null && omarchy-launch-terminal bash -c \x27cd \x22" + fullPath + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27 || xdg-terminal-exec bash -c \x27cd \x22" + fullPath + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27"
-                              ])
+                          // 单仓拉取按钮 (仅在 behind > 0 时显示)
+                          Rectangle {
+                            visible: Boolean(modelData.behind > 0)
+                            height: Style.space(20)
+                            width: subPullBtnRow.implicitWidth + Style.space(10)
+                            radius: Style.space(3)
+                            color: subPullBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                            border.color: root.colors.yellow
+                            border.width: 1
+
+                            MouseArea {
+                              id: subPullBtnArea
+                              anchors.fill: parent
+                              hoverEnabled: true
+                              cursorShape: Qt.PointingHandCursor
+                              enabled: !root.gitChecking
+                              onClicked: root.pullGitRepos(modelData.name)
+                            }
+
+                            Row {
+                              id: subPullBtnRow
+                              anchors.centerIn: parent
+                              spacing: Style.space(4)
+                              Text {
+                                text: "\uf019"
+                                color: root.colors.yellow
+                                font.family: "JetBrainsMono Nerd Font, monospace"
+                                font.pixelSize: Style.font.caption * 0.75
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
+                              Text {
+                                text: (root.gitPulling && root.pullingRepoName === modelData.name) ? "拉取中" : "拉取"
+                                color: root.colors.text
+                                font.pixelSize: Style.font.caption * 0.75
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
                             }
                           }
 
-                          Row {
-                            id: openTermBtnRow
-                            anchors.centerIn: parent
-                            spacing: Style.space(4)
-                            Text {
-                              text: "\uf120"
-                              color: root.colors.subtext0
-                              font.family: "JetBrainsMono Nerd Font, monospace"
-                              font.pixelSize: Style.font.caption * 0.75
-                              anchors.verticalCenter: parent.verticalCenter
+                          // 终端打开按钮
+                          Rectangle {
+                            id: openTermBtnRect
+                            height: Style.space(20)
+                            width: openTermBtnRow.implicitWidth + Style.space(10)
+                            radius: Style.space(3)
+                            color: openTermBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+
+                            MouseArea {
+                              id: openTermBtnArea
+                              anchors.fill: parent
+                              hoverEnabled: true
+                              cursorShape: Qt.PointingHandCursor
+                              onClicked: {
+                                var fullPath = (root.inputProjectPath || root.projectPath) + "/" + (root.gitLibsDirName || "libs_source") + "/" + modelData.name
+                                Quickshell.execDetached([
+                                  "sh", "-c",
+                                  "command -v omarchy-launch-terminal >/dev/null && omarchy-launch-terminal bash -c \x27cd \x22" + fullPath + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27 || xdg-terminal-exec bash -c \x27cd \x22" + fullPath + "\x22 && git status; echo; read -p \x22按回车键退出...\x22\x27"
+                                ])
+                              }
                             }
-                            Text {
-                              text: "终端打开"
-                              color: root.colors.text
-                              font.pixelSize: Style.font.caption * 0.75
-                              anchors.verticalCenter: parent.verticalCenter
+
+                            Row {
+                              id: openTermBtnRow
+                              anchors.centerIn: parent
+                              spacing: Style.space(4)
+                              Text {
+                                text: "\uf120"
+                                color: root.colors.subtext0
+                                font.family: "JetBrainsMono Nerd Font, monospace"
+                                font.pixelSize: Style.font.caption * 0.75
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
+                              Text {
+                                text: "终端打开"
+                                color: root.colors.text
+                                font.pixelSize: Style.font.caption * 0.75
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
                             }
                           }
                         }

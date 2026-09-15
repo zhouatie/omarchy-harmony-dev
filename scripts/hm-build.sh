@@ -36,6 +36,7 @@ MAC_HOST="${HARMONY_MAC_HOST:-${CFG_HOST:-chenbolun@10.221.68.124}}"
 CACHE_DIR="$HOME/.cache/harmony"
 mkdir -p "$CACHE_DIR"
 LOG_FILE="$CACHE_DIR/remote-build.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 START_TIME_TOTAL=$(date +%s)
 
@@ -256,6 +257,7 @@ if [ "$DO_SYNC" = true ]; then
   log_step "1. 检查 Mac 连通性并校验目录安全..."
   if ! ssh -o BatchMode=yes -o ConnectTimeout=3 "$MAC_HOST" "echo ok" >/dev/null 2>&1; then
     log_err "无法通过 SSH 连接到 $MAC_HOST，请确认网络环境及免密配置。"
+    echo -e "### 鸿蒙远程连接失败诊断\n- **目标主机**: $MAC_HOST\n- **原因**: 无法通过 SSH 连接，网络超时或免密配置失效。\n- **排查建议**: 请测试 \`ssh $MAC_HOST\` 并检查网络/VPN。" > "$CACHE_DIR/last-error.log"
     notify_desktop "HarmonyOS 构建失败" "无法连接到 Mac 主机: $MAC_HOST" "critical"
     exit 1
   fi
@@ -339,11 +341,23 @@ if [ "$DO_BUILD" = true ]; then
 
   if ssh -tt "$MAC_HOST" "$REMOTE_COMMANDS" 2>&1 | tee -a "$LOG_FILE"; then
     log_info "远程构建成功 (耗时: $(format_duration $(( $(date +%s) - STEP2_START )) ))！"
+    rm -f "$CACHE_DIR/last-error.log" "$CACHE_DIR/last-error.json" 2>/dev/null || true
   else
     echo ""
-    log_err "远程构建失败！"
+    log_err "远程构建失败！正在智能提取关键编译错误与排查信息..."
+    if [ -f "$SCRIPT_DIR/parse-build-errors.py" ]; then
+      python3 "$SCRIPT_DIR/parse-build-errors.py" \
+        --log "$LOG_FILE" \
+        --local "$PROJECT_ROOT" \
+        --remote "$REMOTE_WORK_DIR" \
+        --out-dir "$CACHE_DIR" \
+        --print-summary || true
+    fi
+    echo ""
     log_err "完整日志已保存至: $LOG_FILE"
-    notify_desktop "HarmonyOS 构建失败" "请查看日志: $LOG_FILE" "critical"
+    log_info "[TIP] AI 诊断就绪: 结构化错误诊断报告已生成至 $CACHE_DIR/last-error.log"
+    log_info "[TIP] 可直接点击面板上的【复制报错(AI)】或在 AI 对话中让其读取该文件"
+    notify_desktop "HarmonyOS 构建失败" "已提取错误摘要，可点击面板复制给 AI" "critical"
     exit 1
   fi
 
@@ -401,6 +415,7 @@ if [ "$DO_INSTALL_APP" = true ]; then
     echo "$INSTALL_OUT"
     if echo "$INSTALL_OUT" | grep -qi -E "\\[Fail\\]|error"; then
       log_err "安装失败，请检查手机屏幕是否弹出了“允许安装”确认框。"
+      echo -e "### 鸿蒙真机安装失败诊断报告\n- **工程**: $PROJECT_NAME\n- **设备**: $TARGETS\n- **产物**: \`$LOCAL_HAP\`\n- **安装输出**:\n\`\`\`\n$INSTALL_OUT\n\`\`\`\n- **排查建议**: 检查手机确认弹窗，或使用 \`hdc uninstall $LOCAL_BUNDLE_NAME\` 后重试。" > "$CACHE_DIR/last-error.log"
       notify_desktop "HarmonyOS 安装失败" "真机安装失败，请查看设备提示" "critical"
     else
       log_info "安装成功 (耗时: $(format_duration $(( $(date +%s) - STEP4_START )) ))！"
