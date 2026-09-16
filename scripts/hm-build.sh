@@ -172,6 +172,10 @@ while [[ $# -gt 0 ]]; do
       CUSTOM_REMOTE_BASE="$2"
       shift 2
       ;;
+    --device-ip)
+      CFG_DEVICE_IP="$2"
+      shift 2
+      ;;
     -p|--path)
       TARGET_DIR="$2"
       shift 2
@@ -408,11 +412,11 @@ if [ "$DO_BUILD" = true ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 步骤 4: 本地 USB 真机安装
+# 步骤 4: 本地真机安装
 # ------------------------------------------------------------------------------
 if [ "$DO_INSTALL_APP" = true ]; then
   STEP4_START=$(date +%s)
-  log_step "4. 检测本地 USB 真机并执行安装..."
+  log_step "4. 检测真机并准备安装..."
 
   if [ -z "$LOCAL_HAP" ] || [ ! -f "$LOCAL_HAP" ]; then
     LOCAL_HAP=$(find "$PROJECT_ROOT" -path '*/outputs/*signed.hap' 2>/dev/null | xargs -r ls -t 2>/dev/null | head -n 1 || find "$PROJECT_ROOT" -name '*.hap' 2>/dev/null | grep -v 'unsigned' | xargs -r ls -t 2>/dev/null | head -n 1 || true)
@@ -426,28 +430,65 @@ if [ "$DO_INSTALL_APP" = true ]; then
   
   hdc start >/dev/null 2>&1 </dev/null || true
 
-  TARGETS=$(timeout 5 hdc list targets 2>/dev/null | grep -v 'Empty' | grep -v '^\[Client\]' | grep -v '^$' | head -n 1 || true)
-  if [ -z "$TARGETS" ] && [ -n "$CFG_DEVICE_IP" ]; then
-    TARGET_IP="$CFG_DEVICE_IP"
-    [[ "$TARGET_IP" != *:* ]] && TARGET_IP="${TARGET_IP}:5555"
-    log_info "未检测到在线设备，正在尝试自动无线连接: $TARGET_IP..."
-    timeout 3 hdc tconn "$TARGET_IP" >/dev/null 2>&1 || true
-    TARGETS=$(timeout 5 hdc list targets 2>/dev/null | grep -v 'Empty' | grep -v '^\[Client\]' | grep -v '^$' | head -n 1 || true)
+  TARGETS=$(timeout 5 hdc list targets 2>/dev/null | tr -d '\r' | grep -v 'Empty' | grep -v '^\[Client\]' | grep -v '^$' || true)
+  # 优先选择有线 USB 真机
+  USB_DEV=$(echo "$TARGETS" | grep -v ':' | awk '{print $1}' | tr -d '\r\n' | head -n 1 || true)
+  if [ -n "$USB_DEV" ]; then
+    DEV_ID="$USB_DEV"
+  else
+    DEV_ID=$(echo "$TARGETS" | head -n 1 | awk '{print $1}' | tr -d '\r\n' || true)
   fi
 
-  if [ -z "$TARGETS" ]; then
+  # 如果没有在线设备，或在线无线设备已休眠失效，进行自动连接/刷新
+  NEED_CONNECT=false
+  if [ -z "$DEV_ID" ]; then
+    NEED_CONNECT=true
+  elif [[ "$DEV_ID" == *:* ]]; then
+    if ! timeout 2 hdc -t "$DEV_ID" shell "echo 1" >/dev/null 2>&1; then
+      log_warn "检测到无线会话已失效/休眠，正在重新建立连接..."
+      NEED_CONNECT=true
+    fi
+  fi
+
+  if [ "$NEED_CONNECT" = true ]; then
+    TARGET_IP="${CFG_DEVICE_IP:-$DEV_ID}"
+    if [ -n "$TARGET_IP" ]; then
+      TARGET_IP=$(echo "$TARGET_IP" | tr -d '\r\n')
+      [[ "$TARGET_IP" != *:* ]] && TARGET_IP="${TARGET_IP}:5555"
+      log_info "正在连接无线真机: $TARGET_IP..."
+      timeout 2 hdc tconn "$TARGET_IP" -d >/dev/null 2>&1 || true
+      timeout 3 hdc tconn "$TARGET_IP" >/dev/null 2>&1 || true
+      sleep 0.5
+      TARGETS=$(timeout 5 hdc list targets 2>/dev/null | tr -d '\r' | grep -v 'Empty' | grep -v '^\[Client\]' | grep -v '^$' | head -n 1 || true)
+      DEV_ID=$(echo "$TARGETS" | awk '{print $1}' | tr -d '\r\n')
+    fi
+  fi
+
+  if [ -z "$DEV_ID" ]; then
     log_warn "未检测到已连接的鸿蒙真机（或设备处于离线状态）。"
     log_info "安装包已保存在: $LOCAL_HAP"
     notify_desktop "HarmonyOS 构建完成" "真机未连接，安装包已就绪" "normal"
   else
-    DEV_ID=$(echo "$TARGETS" | awk '{print $1}')
+    HAP_SIZE=$(ls -lh "$LOCAL_HAP" 2>/dev/null | awk '{print $5}' || true)
     if [[ "$DEV_ID" == *:* ]]; then
+      log_step "4. 无线传输并安装 (包体: ${HAP_SIZE:-未知} · 约需 1~2 分钟)..."
       log_info "检测到在线无线设备: $DEV_ID"
+      log_info "正在通过无线网络传输并安装 (安装包大小: ${HAP_SIZE:-未知}，传输约需 1~2 分钟，请稍候)..."
     else
+      log_step "4. 推送并安装至真机 (包体: ${HAP_SIZE:-未知})..."
       log_info "检测到在线设备: $DEV_ID"
+      log_info "正在推送到真机安装 (安装包大小: ${HAP_SIZE:-未知})..."
     fi
-    log_info "正在推送到真机安装 (hdc install)..."
     INSTALL_OUT=$(hdc -t "$DEV_ID" install "$LOCAL_HAP" 2>&1 || true)
+
+    # 针对无线连接的 Session not found / 断连 / 超时异常，自动重置无线连接并重试
+    if echo "$INSTALL_OUT" | grep -qi -E "Session not found|No device|Connect failed|Timeout waiting" && [[ "$DEV_ID" == *:* ]]; then
+      log_warn "安装检测到异常 ($INSTALL_OUT)，正在自动重置无线连接并重试..."
+      timeout 2 hdc tconn "$DEV_ID" -d >/dev/null 2>&1 || true
+      timeout 3 hdc tconn "$DEV_ID" >/dev/null 2>&1 || true
+      sleep 1
+      INSTALL_OUT=$(hdc -t "$DEV_ID" install "$LOCAL_HAP" 2>&1 || true)
+    fi
     echo "$INSTALL_OUT"
     if echo "$INSTALL_OUT" | grep -qi -E "\\[Fail\\]|error"; then
       log_err "安装失败，请检查手机屏幕是否弹出了“允许安装”确认框。"
@@ -456,9 +497,11 @@ if [ "$DO_INSTALL_APP" = true ]; then
     else
       log_info "安装成功 (耗时: $(format_duration $(( $(date +%s) - STEP4_START )) ))！"
       if [ "$DO_LAUNCH" = true ] && [ -n "$LOCAL_BUNDLE_NAME" ]; then
+        log_step "5. 正在拉起应用: $LOCAL_BUNDLE_NAME..."
         log_info "正在拉起应用: $LOCAL_BUNDLE_NAME..."
         hdc -t "$DEV_ID" shell aa start -a EntryAbility -b "$LOCAL_BUNDLE_NAME" || true
       fi
+      log_step "真机安装成功"
       notify_desktop "HarmonyOS 安装成功" "应用已安装并拉起: $PROJECT_NAME" "normal"
     fi
   fi

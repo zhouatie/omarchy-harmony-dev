@@ -50,6 +50,7 @@ BarWidget {
   property bool building: false
   property string buildStatus: "就绪"
   property string buildStage: ""
+  property string currentBuildMode: ""
   property var buildLogs: []
   property int buildElapsedSeconds: 0
   property string logFeedback: ""
@@ -401,9 +402,10 @@ BarWidget {
   function startBuild(mode) {
     if (root.building) return
     root.building = true
+    root.currentBuildMode = mode
     root.buildElapsedSeconds = 0
-    root.buildStage = "正在初始化..."
-    root.buildStatus = "构建中..."
+    root.buildStage = (mode === "install-only" ? "4. 检测真机并准备安装..." : (mode === "sync-only" ? "1. 同步工程源码..." : "正在初始化..."))
+    root.buildStatus = (mode === "install-only" ? "安装中..." : (mode === "sync-only" ? "同步中..." : "构建中..."))
     root.buildErrorCount = 0
     root.logFeedback = ""
     root.buildLogs = ["[" + new Date().toLocaleTimeString() + "] 开始执行模式: " + mode]
@@ -417,6 +419,9 @@ BarWidget {
     }
     if (root.inputProjectPath) {
       args.push("--path", root.inputProjectPath)
+    }
+    if (root.inputDeviceIp) {
+      args.push("--device-ip", root.inputDeviceIp)
     }
     if (!root.autoInstall) {
       args.push("--no-install")
@@ -881,7 +886,15 @@ BarWidget {
                 Text {
                   id: statusBadgeText
                   anchors.centerIn: parent
-                  text: root.building ? ("构建中 " + root.buildElapsedSeconds + "s") : root.buildStatus
+                  text: {
+                    if (!root.building) return root.buildStatus
+                    var modeText = "构建中"
+                    if (root.currentBuildMode === "install-only") modeText = "安装中"
+                    else if (root.currentBuildMode === "sync-only") modeText = "同步中"
+                    else if (root.currentBuildMode === "clean") modeText = "清理中"
+                    else if (root.currentBuildMode === "deps") modeText = "装依赖"
+                    return modeText + " " + root.buildElapsedSeconds + "s"
+                  }
                   color: root.colors.crust
                   font.pixelSize: Style.font.caption
                   font.bold: true
@@ -1753,12 +1766,20 @@ BarWidget {
                 }
 
                 Text {
-                  text: root.building ? ("正在构建中... (" + root.buildElapsedSeconds + "s)") : "一键全流程构建并真机安装"
+                  text: {
+                    if (!root.building) return "一键全流程构建并真机安装"
+                    if (root.buildStage) return root.buildStage + " (" + root.buildElapsedSeconds + "s)"
+                    if (root.currentBuildMode === "install-only") return "正在真机安装... (" + root.buildElapsedSeconds + "s)"
+                    if (root.currentBuildMode === "sync-only") return "正在同步代码... (" + root.buildElapsedSeconds + "s)"
+                    return "正在构建中... (" + root.buildElapsedSeconds + "s)"
+                  }
                   color: root.colors.crust
                   font.family: Style.font.family
                   font.pixelSize: Style.font.body
                   font.bold: true
                   anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideMiddle
+                  maximumLineCount: 1
                 }
               }
             }
@@ -2571,7 +2592,7 @@ BarWidget {
 
                 MouseArea {
                   anchors.fill: parent
-                  anchors.rightMargin: shellTermBtnRect.width + Style.space(12)
+                  anchors.rightMargin: shellActionBtns.width + Style.space(12)
                   hoverEnabled: true
                   cursorShape: (!root.gitShellClean && root.gitShellFiles.length > 0) ? Qt.PointingHandCursor : Qt.ArrowCursor
                   enabled: !root.gitShellClean && root.gitShellFiles.length > 0
@@ -2580,8 +2601,6 @@ BarWidget {
 
                 Row {
                   anchors.left: parent.left
-                  anchors.right: shellTermBtnRect.left
-                  anchors.rightMargin: Style.space(8)
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(8)
 
@@ -2684,6 +2703,7 @@ BarWidget {
 
                 // 壳工程操作按钮
                 Row {
+                  id: shellActionBtns
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(6)

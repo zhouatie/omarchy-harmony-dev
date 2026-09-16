@@ -63,16 +63,31 @@ if command -v hdc >/dev/null 2>&1; then
   fi
 
   if [ -n "$HDC_OUT" ] && ! echo "$HDC_OUT" | grep -qi "Empty"; then
-    DEV_ID=$(echo "$HDC_OUT" | head -n 1 | awk '{print $1}' | tr -d '\r\n')
+    # 优先使用有线 USB 设备，若无则使用无线设备
+    USB_DEV=$(echo "$HDC_OUT" | grep -v ':' | awk '{print $1}' | tr -d '\r\n' | head -n 1 || true)
+    if [ -n "$USB_DEV" ]; then
+      DEV_ID="$USB_DEV"
+    else
+      DEV_ID=$(echo "$HDC_OUT" | head -n 1 | awk '{print $1}' | tr -d '\r\n')
+    fi
     if [ -n "$DEV_ID" ]; then
       [[ "$DEV_ID" == *:* ]] && IS_WIRELESS=true
       MODEL=$(timeout 2 hdc -t "$DEV_ID" shell param get const.product.model 2>/dev/null | tr -d '\r\n ' || true)
       if [ -n "$MODEL" ] && ! echo "$MODEL" | grep -qi -E "fail|error"; then
         DEVICE_NAME="$DEV_ID ($MODEL)"
-      else
-        DEVICE_NAME="$DEV_ID"
+        DEVICE_ONLINE=true
+      elif [ "$IS_WIRELESS" = true ] && [ -n "$DEVICE_IP" ]; then
+        # 会话失效，断开后重新建立
+        TARGET_IP="$DEVICE_IP"
+        [[ "$TARGET_IP" != *:* ]] && TARGET_IP="${TARGET_IP}:5555"
+        timeout 2 hdc tconn "$TARGET_IP" -d >/dev/null 2>&1 || true
+        timeout 2 hdc tconn "$TARGET_IP" >/dev/null 2>&1 || true
+        MODEL=$(timeout 2 hdc -t "$DEV_ID" shell param get const.product.model 2>/dev/null | tr -d '\r\n ' || true)
+        if [ -n "$MODEL" ] && ! echo "$MODEL" | grep -qi -E "fail|error"; then
+          DEVICE_NAME="$DEV_ID ($MODEL)"
+          DEVICE_ONLINE=true
+        fi
       fi
-      DEVICE_ONLINE=true
     fi
   fi
 fi
