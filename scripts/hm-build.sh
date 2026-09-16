@@ -15,10 +15,18 @@
 
 set -eo pipefail
 
+cleanup() {
+  # 终止本脚本产生的所有子进程 (如 ssh, rsync, tee 等)
+  pkill -P $$ 2>/dev/null || true
+}
+trap cleanup INT TERM
+
+
 CONFIG_FILE="$HOME/.config/harmony/config.json"
 CFG_HOST=""
 CFG_REMOTE=""
 CFG_PROJECT=""
+CFG_DEVICE_IP=""
 CFG_AUTO_INSTALL=true
 CFG_AUTO_LAUNCH=true
 
@@ -26,6 +34,7 @@ if [ -f "$CONFIG_FILE" ]; then
   CFG_HOST=$(jq -r '.macHost // empty' "$CONFIG_FILE" 2>/dev/null || true)
   CFG_REMOTE=$(jq -r '.remoteDir // empty' "$CONFIG_FILE" 2>/dev/null || true)
   CFG_PROJECT=$(jq -r '.projectPath // empty' "$CONFIG_FILE" 2>/dev/null || true)
+  CFG_DEVICE_IP=$(jq -r '.deviceIp // empty' "$CONFIG_FILE" 2>/dev/null || true)
   _ai=$(jq -r '.autoInstall // empty' "$CONFIG_FILE" 2>/dev/null || true)
   [ "$_ai" = "false" ] && CFG_AUTO_INSTALL=false
   _al=$(jq -r '.autoLaunch // empty' "$CONFIG_FILE" 2>/dev/null || true)
@@ -88,6 +97,7 @@ DO_BUILD=true
 DO_INSTALL_APP=$CFG_AUTO_INSTALL
 DO_LAUNCH=$CFG_AUTO_LAUNCH
 DO_DEPS=false
+DO_SYNC_DEPS=false
 DO_CLEAN=false
 TARGET_DIR="${CFG_PROJECT:-}"
 CUSTOM_REMOTE_BASE="${HARMONY_REMOTE_DIR:-${CFG_REMOTE:-~/Dev/harmony}}"
@@ -103,6 +113,7 @@ print_usage() {
   --sync-only           仅同步本地代码至 Mac mini，不执行构建
   --build-only          跳过代码同步，直接在 Mac mini 上构建并拉取产物
   --deps                在远程执行 ohpm install 安装/更新三方依赖
+  --sync-deps           构建前根据 dep-switch.json5 自动对齐并同步子仓代码
   --clean               在远程执行深度清理(清缓存+clean)，提MR前推荐执行以对齐CI环境
   --no-launch           安装成功后不自动拉起 EntryAbility
   --host <user@ip>      指定远程 Mac 机器地址 (默认从配置读取或: $MAC_HOST)
@@ -139,6 +150,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --deps)
       DO_DEPS=true
+      shift
+      ;;
+    --sync-deps)
+      DO_SYNC_DEPS=true
       shift
       ;;
     --clean)
@@ -250,6 +265,16 @@ if [ -d "$PROJECT_ROOT/.git" ]; then
 fi
 
 # ------------------------------------------------------------------------------
+# 步骤 0.8: 根据 dep-switch.json5 对齐并同步子仓代码
+# ------------------------------------------------------------------------------
+if [ "$DO_SYNC_DEPS" = true ]; then
+  log_step "0.8. 根据 dep-switch.json5 对齐并同步本地子仓代码..."
+  if [ -f "$SCRIPT_DIR/check-git.py" ]; then
+    python3 "$SCRIPT_DIR/check-git.py" --path "$PROJECT_ROOT" --sync-deps
+  fi
+fi
+
+# ------------------------------------------------------------------------------
 # 步骤 1: 检查远程连通性并执行“防覆盖身份校验”
 # ------------------------------------------------------------------------------
 if [ "$DO_SYNC" = true ]; then
@@ -307,8 +332,6 @@ EOF"
     --exclude='**/.hvigor' \
     --exclude='.cxx' \
     --exclude='**/.cxx' \
-    --exclude='BuildProfile.ets' \
-    --exclude='**/BuildProfile.ets' \
     --exclude='.DS_Store' \
     --exclude='**/.DS_Store' \
     --exclude='local.properties' \
@@ -325,7 +348,7 @@ if [ "$DO_BUILD" = true ]; then
   log_info "构建日志将实时打印，并同步存入: $LOG_FILE"
   echo "--- Remote Build Started at $(date) ---" > "$LOG_FILE"
 
-  REMOTE_COMMANDS="export NODE_HOME=/Applications/DevEco-Studio.app/Contents/tools/node; export DEVECO_SDK_HOME=/Applications/DevEco-Studio.app/Contents/sdk; export JAVA_HOME=/Applications/DevEco-Studio.app/Contents/jbr/Contents/Home; export PATH=\$JAVA_HOME/bin:/Applications/DevEco-Studio.app/Contents/tools/node/bin:/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin:/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin:/opt/homebrew/bin:\$PATH; cd $REMOTE_WORK_DIR"
+  REMOTE_COMMANDS="export DEVELOPER_DIR=/Library/Developer/CommandLineTools; export NODE_HOME=/Applications/DevEco-Studio.app/Contents/tools/node; export DEVECO_SDK_HOME=/Applications/DevEco-Studio.app/Contents/sdk; export JAVA_HOME=/Applications/DevEco-Studio.app/Contents/jbr/Contents/Home; export PATH=/Library/Developer/CommandLineTools/usr/bin:\$JAVA_HOME/bin:/Applications/DevEco-Studio.app/Contents/tools/node/bin:/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin:/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin:/opt/homebrew/bin:\$PATH; cd $REMOTE_WORK_DIR"
 
   if [ "$DO_CLEAN" = true ]; then
     log_info "远程执行深度清理 (清理 build/.hvigor 缓存与 hvigorw clean)..."
@@ -404,24 +427,37 @@ if [ "$DO_INSTALL_APP" = true ]; then
   hdc start >/dev/null 2>&1 </dev/null || true
 
   TARGETS=$(timeout 5 hdc list targets 2>/dev/null | grep -v 'Empty' | grep -v '^\[Client\]' | grep -v '^$' | head -n 1 || true)
+  if [ -z "$TARGETS" ] && [ -n "$CFG_DEVICE_IP" ]; then
+    TARGET_IP="$CFG_DEVICE_IP"
+    [[ "$TARGET_IP" != *:* ]] && TARGET_IP="${TARGET_IP}:5555"
+    log_info "未检测到在线设备，正在尝试自动无线连接: $TARGET_IP..."
+    timeout 3 hdc tconn "$TARGET_IP" >/dev/null 2>&1 || true
+    TARGETS=$(timeout 5 hdc list targets 2>/dev/null | grep -v 'Empty' | grep -v '^\[Client\]' | grep -v '^$' | head -n 1 || true)
+  fi
+
   if [ -z "$TARGETS" ]; then
-    log_warn "未检测到 USB 连接的鸿蒙真机（或设备处于离线状态）。"
+    log_warn "未检测到已连接的鸿蒙真机（或设备处于离线状态）。"
     log_info "安装包已保存在: $LOCAL_HAP"
     notify_desktop "HarmonyOS 构建完成" "真机未连接，安装包已就绪" "normal"
   else
-    log_info "检测到在线设备: $TARGETS"
-    log_info "正在通过本地 USB 安装 (hdc install)..."
-    INSTALL_OUT=$(hdc install "$LOCAL_HAP" 2>&1 || true)
+    DEV_ID=$(echo "$TARGETS" | awk '{print $1}')
+    if [[ "$DEV_ID" == *:* ]]; then
+      log_info "检测到在线无线设备: $DEV_ID"
+    else
+      log_info "检测到在线设备: $DEV_ID"
+    fi
+    log_info "正在推送到真机安装 (hdc install)..."
+    INSTALL_OUT=$(hdc -t "$DEV_ID" install "$LOCAL_HAP" 2>&1 || true)
     echo "$INSTALL_OUT"
     if echo "$INSTALL_OUT" | grep -qi -E "\\[Fail\\]|error"; then
       log_err "安装失败，请检查手机屏幕是否弹出了“允许安装”确认框。"
-      echo -e "### 鸿蒙真机安装失败诊断报告\n- **工程**: $PROJECT_NAME\n- **设备**: $TARGETS\n- **产物**: \`$LOCAL_HAP\`\n- **安装输出**:\n\`\`\`\n$INSTALL_OUT\n\`\`\`\n- **排查建议**: 检查手机确认弹窗，或使用 \`hdc uninstall $LOCAL_BUNDLE_NAME\` 后重试。" > "$CACHE_DIR/last-error.log"
+      echo -e "### 鸿蒙真机安装失败诊断报告\n- **工程**: $PROJECT_NAME\n- **设备**: $DEV_ID\n- **产物**: \`$LOCAL_HAP\`\n- **安装输出**:\n\`\`\`\n$INSTALL_OUT\n\`\`\`\n- **排查建议**: 检查手机确认弹窗，或使用 \`hdc -t $DEV_ID uninstall $LOCAL_BUNDLE_NAME\` 后重试。" > "$CACHE_DIR/last-error.log"
       notify_desktop "HarmonyOS 安装失败" "真机安装失败，请查看设备提示" "critical"
     else
       log_info "安装成功 (耗时: $(format_duration $(( $(date +%s) - STEP4_START )) ))！"
       if [ "$DO_LAUNCH" = true ] && [ -n "$LOCAL_BUNDLE_NAME" ]; then
         log_info "正在拉起应用: $LOCAL_BUNDLE_NAME..."
-        hdc shell aa start -a EntryAbility -b "$LOCAL_BUNDLE_NAME" || true
+        hdc -t "$DEV_ID" shell aa start -a EntryAbility -b "$LOCAL_BUNDLE_NAME" || true
       fi
       notify_desktop "HarmonyOS 安装成功" "应用已安装并拉起: $PROJECT_NAME" "normal"
     fi

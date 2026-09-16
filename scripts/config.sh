@@ -10,6 +10,7 @@ DEFAULT_HOST="chenbolun@10.221.68.124"
 DEFAULT_REMOTE_DIR="~/Dev/harmony"
 DEFAULT_PROJECT_PATH=""
 DEFAULT_TRUNK_BRANCH=""
+DEFAULT_DEVICE_IP=""
 
 action="${1:-get}"
 
@@ -22,6 +23,7 @@ case "$action" in
   "remoteDir": "$DEFAULT_REMOTE_DIR",
   "projectPath": "$DEFAULT_PROJECT_PATH",
   "trunkBranch": "$DEFAULT_TRUNK_BRANCH",
+  "deviceIp": "$DEFAULT_DEVICE_IP",
   "autoInstall": true,
   "autoLaunch": true
 }

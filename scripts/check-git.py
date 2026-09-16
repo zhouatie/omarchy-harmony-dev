@@ -20,7 +20,78 @@ def parse_args():
     parser.add_argument("--trunk", type=str, default="", help="Target trunk branch for MR comparison")
     parser.add_argument("--pull", action="store_true", help="Pull latest for repos that are behind remote (--ff-only)")
     parser.add_argument("--pull-repo", type=str, default="", help="Pull specific repo by name or path (--ff-only)")
+    parser.add_argument("--sync-deps", action="store_true", help="Sync all subrepos with dep-switch.json5 (clone missing, align branch, ff-only pull)")
+    parser.add_argument("--sync-dep-repo", type=str, default="", help="Sync specific subrepo with dep-switch.json5 by name")
     return parser.parse_args()
+
+def strip_json5(text):
+    pattern = re.compile(
+        r'(/\*[\s\S]*?\*/|//[^\r\n]*)|("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+    )
+    def repl(m):
+        if m.group(1):
+            return ""
+        s = m.group(2)
+        if s and s.startswith("'"):
+            inner = s[1:-1].replace('"', '\\"').replace("\\'", "'")
+            return f'"{inner}"'
+        return s
+    cleaned = pattern.sub(repl, text)
+    cleaned = re.sub(r'([{\s,])([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', cleaned)
+    return re.sub(r",(\s*[}\]])", r"\1", cleaned)
+
+def parse_dep_switch(proj_path):
+    dep_switch = os.path.join(proj_path, "dep-switch.json5")
+    if not os.path.isfile(dep_switch):
+        return None
+    try:
+        with open(dep_switch, "r", encoding="utf-8") as f:
+            raw = f.read()
+        cleaned = strip_json5(raw)
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def get_default_git_host(proj_path):
+    try:
+        res = subprocess.run(["git", "-C", proj_path, "remote", "get-url", "origin"], capture_output=True, text=True, timeout=1)
+        if res.returncode == 0 and res.stdout.strip():
+            url = res.stdout.strip()
+            m = re.match(r"^(ssh://[^/]+(?::\d+)?)", url)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return "ssh://git@g.hz.netease.com:22222"
+
+def extract_git_dependencies(proj_path, dep_data):
+    if not dep_data or not isinstance(dep_data, dict):
+        return []
+    default_host = get_default_git_host(proj_path)
+    deps = []
+    for d in dep_data.get("dependencies", []):
+        if not isinstance(d, dict):
+            continue
+        if d.get("source") == "npm":
+            continue
+        project = d.get("project", "").strip()
+        if not project:
+            continue
+        git_host = d.get("gitHost") or default_host
+        git_group = d.get("gitGroup") or "cloudmusic-harmony-lib"
+        git_name = d.get("gitName") or project
+        git_url = d.get("gitUrl") or f"{git_host}/{git_group}/{git_name}.git"
+        git_branch = d.get("gitBranch", "").strip()
+        deps.append({
+            "project": project,
+            "gitBranch": git_branch,
+            "gitUrl": git_url,
+            "gitGroup": git_group,
+            "gitName": git_name,
+            "gitHost": git_host
+        })
+    return deps
 
 def resolve_trunk_branch(proj_path, specified_trunk):
     if specified_trunk:
@@ -39,18 +110,15 @@ def resolve_trunk_branch(proj_path, specified_trunk):
             pass
 
     # Auto-detect from dep-switch.json5
-    dep_switch = os.path.join(proj_path, "dep-switch.json5")
-    if os.path.isfile(dep_switch):
-        try:
-            with open(dep_switch, "r", encoding="utf-8") as f:
-                branches = re.findall(r"\"gitBranch\"\s*:\s*\"([^\"]+)\"", f.read())
-                if branches:
-                    for b, _ in Counter(branches).most_common():
-                        if not b.startswith("feat/") and not b.startswith("fix/"):
-                            return b
-                    return Counter(branches).most_common(1)[0][0]
-        except Exception:
-            pass
+    dep_data = parse_dep_switch(proj_path)
+    if dep_data:
+        git_deps = extract_git_dependencies(proj_path, dep_data)
+        branches = [d["gitBranch"] for d in git_deps if d.get("gitBranch")]
+        if branches:
+            for b, _ in Counter(branches).most_common():
+                if not b.startswith("feat/") and not b.startswith("fix/"):
+                    return b
+            return Counter(branches).most_common(1)[0][0]
 
     # Auto-detect from subrepos
     for c in ["libs_source", "lib_source"]:
@@ -259,6 +327,78 @@ def pull_single_repo(repo_path, name=""):
     except Exception as e:
         return {"name": repo_name, "path": repo_path, "ok": False, "msg": str(e)}
 
+def sync_single_dep_repo(dep_info, target_lib_dir):
+    name = dep_info["project"]
+    target_branch = dep_info.get("gitBranch", "").strip()
+    git_url = dep_info.get("gitUrl", "").strip()
+    repo_path = os.path.join(target_lib_dir, name)
+
+    if not os.path.exists(repo_path):
+        # Missing repo: clone it
+        if not git_url:
+            return {"name": name, "ok": False, "skipped": False, "msg": "未配置 gitUrl，无法克隆"}
+        try:
+            os.makedirs(target_lib_dir, exist_ok=True)
+            cmd = ["git", "clone"]
+            if target_branch:
+                cmd.extend(["-b", target_branch])
+            cmd.extend([git_url, repo_path])
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if res.returncode == 0:
+                return {"name": name, "ok": True, "skipped": False, "msg": f"克隆成功 ({target_branch or 'default'})"}
+            else:
+                err = res.stderr.strip() or res.stdout.strip()
+                return {"name": name, "ok": False, "skipped": False, "msg": f"克隆失败: {err}"}
+        except subprocess.TimeoutExpired:
+            return {"name": name, "ok": False, "skipped": False, "msg": "克隆超时 (60s)"}
+        except Exception as e:
+            return {"name": name, "ok": False, "skipped": False, "msg": f"克隆异常: {str(e)}"}
+
+    git_dir = os.path.join(repo_path, ".git")
+    if not os.path.exists(git_dir):
+        return {"name": name, "ok": False, "skipped": True, "msg": "非 Git 仓库，跳过"}
+
+    # Check if dirty
+    try:
+        st_res = subprocess.run(["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True, timeout=5)
+        if st_res.returncode != 0:
+            return {"name": name, "ok": False, "skipped": False, "msg": "git status 失败"}
+        is_dirty = bool(st_res.stdout.strip())
+        if is_dirty:
+            return {"name": name, "ok": False, "skipped": True, "msg": "存在本地修改，已安全跳过切换"}
+
+        # Get current branch
+        br_res = subprocess.run(["git", "-C", repo_path, "branch", "--show-current"], capture_output=True, text=True, timeout=5)
+        cur_branch = br_res.stdout.strip()
+
+        # If target_branch is specified and different from current branch
+        if target_branch and cur_branch != target_branch:
+            ck_local = subprocess.run(["git", "-C", repo_path, "rev-parse", "--verify", f"refs/heads/{target_branch}"], capture_output=True, timeout=3)
+            if ck_local.returncode == 0:
+                sw_res = subprocess.run(["git", "-C", repo_path, "checkout", target_branch], capture_output=True, text=True, timeout=10)
+                if sw_res.returncode != 0:
+                    return {"name": name, "ok": False, "skipped": False, "msg": f"切换分支失败: {sw_res.stderr.strip() or sw_res.stdout.strip()}"}
+            else:
+                subprocess.run(["git", "-C", repo_path, "fetch", "origin", target_branch], capture_output=True, timeout=15)
+                sw_res = subprocess.run(["git", "-C", repo_path, "checkout", "-b", target_branch, f"origin/{target_branch}"], capture_output=True, text=True, timeout=10)
+                if sw_res.returncode != 0:
+                    sw_res = subprocess.run(["git", "-C", repo_path, "checkout", target_branch], capture_output=True, text=True, timeout=10)
+                    if sw_res.returncode != 0:
+                        return {"name": name, "ok": False, "skipped": False, "msg": f"检出目标分支 {target_branch} 失败: {sw_res.stderr.strip() or sw_res.stdout.strip()}"}
+
+        # Pull fast-forward
+        pull_res = subprocess.run(["git", "-C", repo_path, "pull", "--ff-only"], capture_output=True, text=True, timeout=25)
+        if pull_res.returncode == 0:
+            msg = f"已对齐 {target_branch}" if target_branch else "已拉取最新"
+            return {"name": name, "ok": True, "skipped": False, "msg": msg}
+        else:
+            err = pull_res.stderr.strip() or pull_res.stdout.strip()
+            return {"name": name, "ok": False, "skipped": False, "msg": f"pull 失败: {err}"}
+    except subprocess.TimeoutExpired:
+        return {"name": name, "ok": False, "skipped": False, "msg": "操作超时 (25s)"}
+    except Exception as e:
+        return {"name": name, "ok": False, "skipped": False, "msg": str(e)}
+
 def main():
     args = parse_args()
     proj_path = resolve_project_path(args.path)
@@ -272,6 +412,10 @@ def main():
 
     trunk_branch = resolve_trunk_branch(proj_path, args.trunk)
 
+    dep_data = parse_dep_switch(proj_path)
+    git_deps = extract_git_dependencies(proj_path, dep_data) if dep_data else []
+    dep_deps_map = {d["project"]: d for d in git_deps}
+
     # Sub-libraries (libs_source / lib_source)
     target_lib_dir = ""
     dir_name = ""
@@ -281,9 +425,35 @@ def main():
             target_lib_dir = p
             dir_name = candidate
             break
+    if not target_lib_dir:
+        target_lib_dir = os.path.join(proj_path, "libs_source")
+        dir_name = "libs_source"
+
+    # Execute sync if requested
+    sync_results = []
+    if args.sync_dep_repo:
+        target_name = args.sync_dep_repo.strip()
+        matched_dep = None
+        for d in git_deps:
+            if d["project"].lower() == target_name.lower():
+                matched_dep = d
+                break
+        if matched_dep:
+            sync_results.append(sync_single_dep_repo(matched_dep, target_lib_dir))
+        else:
+            sync_results.append({
+                "name": target_name,
+                "ok": False,
+                "skipped": False,
+                "msg": f"dep-switch.json5 中未找到依赖 {target_name}"
+            })
+    elif args.sync_deps:
+        if git_deps:
+            with ThreadPoolExecutor(max_workers=8) as sync_exec:
+                sync_results = list(sync_exec.map(lambda d: sync_single_dep_repo(d, target_lib_dir), git_deps))
 
     subdirs = []
-    if target_lib_dir:
+    if os.path.isdir(target_lib_dir):
         try:
             for entry in sorted(os.listdir(target_lib_dir)):
                 full_p = os.path.join(target_lib_dir, entry)
@@ -291,6 +461,9 @@ def main():
                     subdirs.append((entry, full_p))
         except Exception:
             pass
+
+    existing_repo_names = {entry for entry, _ in subdirs}
+    missing_repos = [d for d in git_deps if d["project"] not in existing_repo_names]
 
     # Execute pull if requested
     pull_results = []
@@ -330,7 +503,7 @@ def main():
                 pull_results = list(pull_exec.map(lambda it: pull_single_repo(it[1], it[0]), repos_to_pull))
 
     # 1. Shell Repo
-    post_fetch = args.fetch if not (args.pull or args.pull_repo) else False
+    post_fetch = args.fetch if not (args.pull or args.pull_repo or args.sync_deps or args.sync_dep_repo) else False
     shell_info = check_single_repo(proj_path, do_fetch=post_fetch, trunk_branch=trunk_branch)
     if not shell_info or shell_info.get("error"):
         shell_info = {"is_git": False}
@@ -338,9 +511,9 @@ def main():
         shell_info["is_git"] = True
 
     libs_info = {
-        "exists": False,
+        "exists": os.path.isdir(target_lib_dir),
         "dir_name": dir_name,
-        "total": 0,
+        "total": len(subdirs),
         "clean": True,
         "dirty_count": 0,
         "behind_count": 0,
@@ -373,10 +546,7 @@ def main():
                 "branch": shell_info.get("branch", "")
             })
 
-    if target_lib_dir:
-        libs_info["exists"] = True
-        libs_info["total"] = len(subdirs)
-
+    if target_lib_dir and os.path.isdir(target_lib_dir):
         def worker(item):
             name, path = item
             res = check_single_repo(path, do_fetch=post_fetch, trunk_branch=trunk_branch)
@@ -400,6 +570,14 @@ def main():
             behind = r.get("behind", 0)
             ahead = r.get("ahead", 0)
 
+            dep_info = dep_deps_map.get(r["name"])
+            dep_branch = dep_info.get("gitBranch", "") if dep_info else ""
+            branch_mismatch = bool(dep_branch and r.get("branch") and r.get("branch") != dep_branch)
+
+            r["dep_branch"] = dep_branch
+            r["branch_mismatch"] = branch_mismatch
+            r["is_missing"] = False
+
             if is_dirty:
                 dirty_count += 1
             if behind > 0:
@@ -407,10 +585,13 @@ def main():
             if ahead > 0:
                 ahead_count += 1
 
-            if is_dirty or behind > 0 or ahead > 0:
+            if is_dirty or behind > 0 or ahead > 0 or branch_mismatch:
                 changed_repos.append({
                     "name": r["name"],
                     "branch": r["branch"],
+                    "dep_branch": dep_branch,
+                    "branch_mismatch": branch_mismatch,
+                    "is_missing": False,
                     "upstream": r.get("upstream", ""),
                     "dirty": is_dirty,
                     "modified": r["modified"],
@@ -423,6 +604,9 @@ def main():
                 clean_repos.append({
                     "name": r["name"],
                     "branch": r["branch"],
+                    "dep_branch": dep_branch,
+                    "branch_mismatch": False,
+                    "is_missing": False,
                     "upstream": r.get("upstream", "")
                 })
 
@@ -447,12 +631,57 @@ def main():
                     "branch": r.get("branch", "")
                 })
 
+        for m in missing_repos:
+            changed_repos.append({
+                "name": m["project"],
+                "branch": "",
+                "dep_branch": m.get("gitBranch", ""),
+                "branch_mismatch": True,
+                "is_missing": True,
+                "upstream": "",
+                "dirty": False,
+                "modified": 0,
+                "untracked": 0,
+                "ahead": 0,
+                "behind": 0,
+                "files": []
+            })
+
         libs_info["dirty_count"] = dirty_count
         libs_info["behind_count"] = behind_count
         libs_info["ahead_count"] = ahead_count
-        libs_info["clean"] = (dirty_count == 0 and behind_count == 0 and ahead_count == 0)
+        libs_info["clean"] = (dirty_count == 0 and behind_count == 0 and ahead_count == 0 and len(missing_repos) == 0 and not any(r.get("branch_mismatch") for r in changed_repos))
         libs_info["changed_repos"] = changed_repos
         libs_info["clean_repos"] = clean_repos
+
+    mismatched_repos_list = [
+        {
+            "name": r["name"],
+            "current_branch": r.get("branch", ""),
+            "target_branch": r.get("dep_branch", ""),
+            "dirty": r.get("dirty", False)
+        }
+        for r in libs_info["changed_repos"] if r.get("branch_mismatch") and not r.get("is_missing")
+    ]
+    missing_repos_list = [
+        {
+            "name": m["project"],
+            "target_branch": m.get("gitBranch", ""),
+            "url": m.get("gitUrl", "")
+        }
+        for m in missing_repos
+    ]
+    aligned_count = len([r for r in all_res if not r.get("branch_mismatch") and r.get("clean")]) if target_lib_dir and os.path.isdir(target_lib_dir) else 0
+
+    dep_switch_summary = {
+        "configured": dep_data is not None,
+        "total_deps": len(git_deps),
+        "mismatch_count": len(mismatched_repos_list),
+        "missing_count": len(missing_repos_list),
+        "aligned_count": aligned_count,
+        "mismatched_repos": mismatched_repos_list,
+        "missing_repos": missing_repos_list
+    }
 
     mr_summary = {
         "trunk_branch": trunk_branch,
@@ -470,7 +699,9 @@ def main():
         "shell": shell_info,
         "libs": libs_info,
         "mr_summary": mr_summary,
-        "pull_results": pull_results
+        "pull_results": pull_results,
+        "sync_results": sync_results,
+        "dep_switch": dep_switch_summary
     }
     print(json.dumps(output, ensure_ascii=False))
 

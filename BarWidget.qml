@@ -87,6 +87,10 @@ BarWidget {
   property string macHost: "chenbolun@10.221.68.124"
   property bool deviceOnline: false
   property string deviceName: "离线"
+  property string deviceIp: ""
+  property string inputDeviceIp: ""
+  property bool isWirelessDevice: false
+  property bool deviceConnecting: false
   property bool projectOk: false
   property string projectPath: ""
   property string projectName: ""
@@ -96,6 +100,10 @@ BarWidget {
   property bool gitChecking: false
   property bool gitPulling: false
   property string pullingRepoName: ""
+  property bool gitSyncingDeps: false
+  property string syncingRepoName: ""
+  property int depSwitchMismatchCount: 0
+  property int depSwitchMissingCount: 0
   property string gitFeedback: ""
   property bool gitOk: false
   property string gitShellBranch: ""
@@ -173,7 +181,7 @@ BarWidget {
   readonly property string tooltipInfo: {
     var lines = ["HarmonyOS 远程构建与调试"]
     lines.push("• 远程 Mac: " + root.macHost + (root.sshOk ? " (已连接)" : " (未连接)"))
-    lines.push("• 本地设备: " + (root.deviceOnline ? (root.deviceName + " (在线)") : "离线"))
+    lines.push("• 本地设备: " + (root.deviceOnline ? (root.deviceName + (root.isWirelessDevice ? " (无线)" : " (USB)")) : "离线"))
     if (root.projectOk) {
       lines.push("• 当前工程: " + root.projectName + (root.bundleName ? (" (" + root.bundleName + ")") : ""))
       if (root.gitShellBranch) {
@@ -183,6 +191,8 @@ BarWidget {
         if (root.gitShellBehind > 0) tags.push("需 pull " + root.gitShellBehind)
         if (root.gitLibsDirtyCount > 0) tags.push(root.gitLibsDirtyCount + " 子仓改动")
         if (root.gitLibsBehindCount > 0) tags.push(root.gitLibsBehindCount + " 子仓需 pull")
+        if (root.depSwitchMismatchCount > 0) tags.push(root.depSwitchMismatchCount + " 子仓分支未对齐")
+        if (root.depSwitchMissingCount > 0) tags.push(root.depSwitchMissingCount + " 子仓未克隆")
         if (root.gitUnmergedCount > 0) tags.push("待提MR " + root.gitUnmergedCount + " 仓")
         lines.push("• Git 状态: " + root.gitShellBranch + " (" + tags.join(" · ") + ")")
       }
@@ -283,6 +293,7 @@ BarWidget {
       remoteDir: root.inputRemoteDir,
       projectPath: root.inputProjectPath,
       trunkBranch: root.inputTrunkBranch,
+      deviceIp: root.inputDeviceIp,
       autoInstall: root.autoInstall,
       autoLaunch: root.autoLaunch
     })
@@ -293,12 +304,32 @@ BarWidget {
   // 刷新环境状态
   function refreshStatus() {
     if (statusProc.running) return
-    statusProc.command = [
+    var args = [
       root.statusScriptPath,
       "--host", root.inputMacHost,
       "--path", root.inputProjectPath
     ]
+    if (root.inputDeviceIp) {
+      args.push("--device-ip", root.inputDeviceIp)
+    }
+    statusProc.command = args
     statusProc.running = true
+  }
+
+  // 手动重连无线真机
+  function reconnectDevice() {
+    if (connectDeviceProc.running) return
+    var ip = (root.inputDeviceIp || root.deviceIp || "").trim()
+    if (!ip) {
+      root.refreshStatus()
+      return
+    }
+    root.deviceConnecting = true
+    connectDeviceProc.command = [
+      "sh", "-c",
+      "export PATH=\"$HOME/.local/harmonyos/command-line-tools/bin:$PATH\"; hdc start >/dev/null 2>&1 || true; ip=\"" + ip + "\"; [[ \"$ip\" != *:* ]] && ip=\"$ip:5555\"; timeout 3 hdc tconn \"$ip\" >/dev/null 2>&1 || true"
+    ]
+    connectDeviceProc.running = true
   }
 
   // 刷新 Git 状态 (超轻量纯本地无网络开销，可选 doFetch=true 手动拉取远端引用)
@@ -338,6 +369,29 @@ BarWidget {
       args.push("--pull-repo", repoName)
     } else {
       args.push("--pull")
+    }
+    gitStatusProc.command = args
+    gitStatusProc.running = true
+  }
+
+  // 对齐 dep-switch 依赖 (repoName 为空时全量对齐，非空时对齐指定仓库)
+  function syncDepSwitch(repoName) {
+    if (gitStatusProc.running) return
+    root.gitChecking = true
+    root.gitSyncingDeps = true
+    root.syncingRepoName = repoName || ""
+    var args = [root.gitScriptPath]
+    var path = root.inputProjectPath || root.projectPath
+    if (path) {
+      args.push("--path", path)
+    }
+    if (root.inputTrunkBranch) {
+      args.push("--trunk", root.inputTrunkBranch)
+    }
+    if (repoName) {
+      args.push("--sync-dep-repo", repoName)
+    } else {
+      args.push("--sync-deps")
     }
     gitStatusProc.command = args
     gitStatusProc.running = true
@@ -391,10 +445,15 @@ BarWidget {
   function cancelBuild() {
     if (buildProc.running) {
       buildProc.kill()
-      root.building = false
-      root.buildStatus = "已中止"
-      root.appendLog("[WARN] 用户手动中止了构建进程。")
     }
+    // 强制清理本地残留的 hm-build 及其子进程
+    Quickshell.execDetached([
+      "sh", "-c",
+      "pkill -TERM -f 'hm-build.sh' 2>/dev/null || true"
+    ])
+    root.building = false
+    root.buildStatus = "已中止"
+    root.appendLog("[WARN] 用户手动中止了构建进程。")
   }
 
   // 外部终端中启动构建
@@ -431,6 +490,10 @@ BarWidget {
         if (cfg.trunkBranch !== undefined) {
           root.inputTrunkBranch = cfg.trunkBranch
           root.trunkBranch = cfg.trunkBranch
+        }
+        if (cfg.deviceIp !== undefined) {
+          root.inputDeviceIp = cfg.deviceIp
+          root.deviceIp = cfg.deviceIp
         }
         if (cfg.autoInstall !== undefined) root.autoInstall = cfg.autoInstall
         if (cfg.autoLaunch !== undefined) root.autoLaunch = cfg.autoLaunch
@@ -478,6 +541,11 @@ BarWidget {
         root.macHost = res.mac_host || root.inputMacHost
         root.deviceOnline = res.device_online === true
         root.deviceName = res.device_name || "离线"
+        root.isWirelessDevice = res.is_wireless === true
+        if (res.device_ip && !root.inputDeviceIp) {
+          root.inputDeviceIp = res.device_ip
+          root.deviceIp = res.device_ip
+        }
         root.projectOk = res.project_ok === true
         root.projectPath = res.project_path || ""
         root.projectName = res.project_name || ""
@@ -494,6 +562,17 @@ BarWidget {
     }
   }
 
+  // 进程：无线设备手动重连
+  Process {
+    id: connectDeviceProc
+    running: false
+    command: []
+    onExited: function(code) {
+      root.deviceConnecting = false
+      root.refreshStatus()
+    }
+  }
+
   // 进程：Git 状态探测
   Process {
     id: gitStatusProc
@@ -507,8 +586,12 @@ BarWidget {
       root.gitChecking = false
       var wasPulling = root.gitPulling
       var pulledTarget = root.pullingRepoName
+      var wasSyncingDeps = root.gitSyncingDeps
+      var syncingTarget = root.syncingRepoName
       root.gitPulling = false
       root.pullingRepoName = ""
+      root.gitSyncingDeps = false
+      root.syncingRepoName = ""
       if (code !== 0) return
       var text = gitStatusCollector.text.trim()
       if (!text) return
@@ -535,6 +618,38 @@ BarWidget {
               "sh", "-c",
               "command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g '\uf126' 'Git' '" + msg + "' || true"
             ])
+          }
+          if (wasSyncingDeps && res.sync_results && res.sync_results.length > 0) {
+            var syncSuccess = 0
+            var syncSkipped = 0
+            var syncFailed = 0
+            for (var si = 0; si < res.sync_results.length; si++) {
+              var sr = res.sync_results[si]
+              if (sr.ok) syncSuccess++
+              else if (sr.skipped) syncSkipped++
+              else syncFailed++
+            }
+            var sMsg = ""
+            if (syncFailed === 0 && syncSkipped === 0) {
+              sMsg = (syncSuccess === 1 ? "依赖已对齐 ✓" : ("已对齐 " + syncSuccess + " 仓 ✓"))
+            } else if (syncFailed === 0) {
+              sMsg = "对齐 " + syncSuccess + " 仓，" + syncSkipped + " 仓跳过(有修改)"
+            } else {
+              sMsg = syncSuccess + " 成功，" + syncSkipped + " 跳过，" + syncFailed + " 失败"
+            }
+            root.gitFeedback = sMsg
+            gitFeedbackTimer.restart()
+            Quickshell.execDetached([
+              "sh", "-c",
+              "command -v omarchy-notification-send >/dev/null && omarchy-notification-send -g '\uf126' 'Git 依赖对齐' '" + sMsg + "' || true"
+            ])
+          }
+          if (res.dep_switch) {
+            root.depSwitchMismatchCount = res.dep_switch.mismatch_count || 0
+            root.depSwitchMissingCount = res.dep_switch.missing_count || 0
+          } else {
+            root.depSwitchMismatchCount = 0
+            root.depSwitchMissingCount = 0
           }
           if (res.trunk_branch) {
             root.trunkBranch = res.trunk_branch
@@ -1121,7 +1236,7 @@ BarWidget {
               }
             }
 
-            // 卡片 2: USB 真机
+            // 卡片 2: 真机设备
             Rectangle {
               width: (parent.width - Style.space(16)) / 3
               height: Style.space(64)
@@ -1138,7 +1253,7 @@ BarWidget {
                 Row {
                   spacing: Style.space(6)
                   Text {
-                    text: "\uf10b"
+                    text: root.isWirelessDevice ? "\uf1eb" : "\uf10b"
                     color: root.colors.subtext0
                     font.family: "JetBrainsMono Nerd Font, monospace"
                     font.pixelSize: Style.font.caption
@@ -1152,7 +1267,7 @@ BarWidget {
                     anchors.verticalCenter: parent.verticalCenter
                   }
                   Text {
-                    text: root.deviceOnline ? "USB 真机在线" : "真机未连接"
+                    text: root.deviceOnline ? (root.isWirelessDevice ? "无线真机在线" : "USB 真机在线") : "真机未连接"
                     color: root.colors.text
                     font.pixelSize: Style.font.caption
                     font.bold: true
@@ -1160,11 +1275,43 @@ BarWidget {
                 }
 
                 Text {
-                  text: root.deviceName
+                  text: root.deviceOnline ? root.deviceName : (root.inputDeviceIp ? ("目标: " + root.inputDeviceIp) : "未连接")
                   color: root.colors.subtext0
                   font.pixelSize: Style.font.caption * 0.9
                   elide: Text.ElideRight
-                  width: parent.width
+                  width: parent.width - (root.inputDeviceIp ? Style.space(18) : 0)
+                }
+              }
+
+              // 右上角无线重连微型按钮 (配置了无线 IP 时展示)
+              Rectangle {
+                visible: Boolean(root.inputDeviceIp)
+                width: Style.space(20)
+                height: Style.space(20)
+                radius: Style.space(4)
+                anchors.top: parent.top
+                anchors.right: parent.right
+                anchors.margins: Style.space(6)
+                color: reconnectBtnArea.containsMouse ? root.colors.surface2 : "transparent"
+
+                Text {
+                  anchors.centerIn: parent
+                  text: "\uf021"
+                  font.family: "JetBrainsMono Nerd Font, monospace"
+                  font.pixelSize: Style.font.caption * 0.9
+                  color: root.deviceConnecting ? root.colors.blue : (reconnectBtnArea.containsMouse ? root.colors.text : root.colors.subtext0)
+                  rotation: root.deviceConnecting ? 180 : 0
+                  Behavior on rotation {
+                    NumberAnimation { duration: 300 }
+                  }
+                }
+
+                MouseArea {
+                  id: reconnectBtnArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.reconnectDevice()
                 }
               }
             }
@@ -1439,6 +1586,41 @@ BarWidget {
                     radius: Style.space(4)
                     color: root.colors.mantle
                     border.color: trunkBranchInput.activeFocus ? root.colors.peach : root.colors.surface1
+                    border.width: 1
+                  }
+                }
+              }
+
+              // 输入项 5: 设备无线 IP
+              Row {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: Style.space(90)
+                  text: "设备无线 IP:"
+                  color: root.colors.subtext0
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                TextField {
+                  id: deviceIpInput
+                  width: parent.width - Style.space(98)
+                  height: Style.space(28)
+                  text: root.inputDeviceIp
+                  onTextEdited: root.inputDeviceIp = text
+                  placeholderText: "如 192.168.1.100 (可选，支持自动静默重连)"
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  color: root.colors.text
+                  selectionColor: root.colors.surface2
+                  selectedTextColor: root.colors.text
+                  placeholderTextColor: root.colors.overlay0
+                  background: Rectangle {
+                    radius: Style.space(4)
+                    color: root.colors.mantle
+                    border.color: deviceIpInput.activeFocus ? root.colors.blue : root.colors.surface1
                     border.width: 1
                   }
                 }
@@ -2242,6 +2424,45 @@ BarWidget {
                   }
                 }
 
+                // 对齐依赖 (在配置了 dep-switch 时显示，若有未对齐或缺失则高亮)
+                Rectangle {
+                  visible: root.depSwitchMismatchCount > 0 || root.depSwitchMissingCount > 0 || (root.gitLibsExists && root.gitLibsTotal > 0)
+                  height: Style.space(26)
+                  width: gitViewSyncDepsText.implicitWidth + Style.space(14)
+                  radius: Style.space(4)
+                  color: gitViewSyncDepsArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                  border.color: (root.depSwitchMismatchCount > 0 || root.depSwitchMissingCount > 0) ? root.colors.peach : root.colors.surface2
+                  border.width: 1
+
+                  MouseArea {
+                    id: gitViewSyncDepsArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    enabled: !root.gitChecking
+                    onClicked: root.syncDepSwitch("")
+                  }
+
+                  Row {
+                    anchors.centerIn: parent
+                    spacing: Style.space(4)
+                    Text {
+                      text: (root.gitSyncingDeps && !root.syncingRepoName) ? "\uf021" : "\uf0ec"
+                      color: (root.depSwitchMismatchCount > 0 || root.depSwitchMissingCount > 0) ? root.colors.peach : root.colors.blue
+                      font.family: "JetBrainsMono Nerd Font, monospace"
+                      font.pixelSize: Style.font.caption * 0.85
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      id: gitViewSyncDepsText
+                      text: (root.gitSyncingDeps && !root.syncingRepoName) ? "对齐中" : "对齐依赖"
+                      color: root.colors.text
+                      font.pixelSize: Style.font.caption * 0.85
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+
                 // 批量拉取 (仅在有仓库落后时显示)
                 Rectangle {
                   visible: (root.gitLibsBehindCount > 0 || root.gitShellBehind > 0)
@@ -2666,6 +2887,46 @@ BarWidget {
                       font.bold: true
                     }
                   }
+
+                  Rectangle {
+                    visible: root.depSwitchMismatchCount > 0
+                    height: Style.space(20)
+                    width: depMismatchBadgeText.implicitWidth + Style.space(10)
+                    radius: Style.space(3)
+                    color: Qt.rgba(249/255, 226/255, 175/255, 0.15)
+                    border.color: root.colors.yellow
+                    border.width: 1
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Text {
+                      id: depMismatchBadgeText
+                      anchors.centerIn: parent
+                      text: "! " + root.depSwitchMismatchCount + " 仓分支未对齐"
+                      color: root.colors.yellow
+                      font.pixelSize: Style.font.caption * 0.85
+                      font.bold: true
+                    }
+                  }
+
+                  Rectangle {
+                    visible: root.depSwitchMissingCount > 0
+                    height: Style.space(20)
+                    width: depMissingBadgeText.implicitWidth + Style.space(10)
+                    radius: Style.space(3)
+                    color: Qt.rgba(243/255, 139/255, 168/255, 0.15)
+                    border.color: root.colors.red
+                    border.width: 1
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Text {
+                      id: depMissingBadgeText
+                      anchors.centerIn: parent
+                      text: "! " + root.depSwitchMissingCount + " 仓未克隆"
+                      color: root.colors.red
+                      font.pixelSize: Style.font.caption * 0.85
+                      font.bold: true
+                    }
+                  }
                 }
 
                 // 全部折叠/展开快捷按钮
@@ -2828,7 +3089,9 @@ BarWidget {
                             height: Style.space(18)
                             width: subBranchBadgeRow.implicitWidth + Style.space(8)
                             radius: Style.space(3)
-                            color: root.colors.surface1
+                            color: Boolean(modelData.branch_mismatch) ? Qt.rgba(249/255, 226/255, 175/255, 0.15) : root.colors.surface1
+                            border.color: Boolean(modelData.branch_mismatch) ? root.colors.yellow : "transparent"
+                            border.width: Boolean(modelData.branch_mismatch) ? 1 : 0
                             anchors.verticalCenter: parent.verticalCenter
 
                             Row {
@@ -2838,17 +3101,18 @@ BarWidget {
 
                               Text {
                                 text: "\ue725"
-                                color: root.colors.blue
+                                color: Boolean(modelData.branch_mismatch) ? root.colors.yellow : root.colors.blue
                                 font.family: "JetBrainsMono Nerd Font, monospace"
                                 font.pixelSize: Style.font.caption * 0.75
                                 anchors.verticalCenter: parent.verticalCenter
                               }
 
                               Text {
-                                text: modelData.branch || "unknown"
-                                color: root.colors.subtext1
+                                text: modelData.is_missing ? ("未克隆 → " + (modelData.dep_branch || "未知")) : (modelData.branch_mismatch ? ((modelData.branch || "unknown") + " → " + modelData.dep_branch) : (modelData.branch || "unknown"))
+                                color: Boolean(modelData.branch_mismatch) ? root.colors.yellow : root.colors.subtext1
                                 font.family: "JetBrainsMono Nerd Font, monospace"
                                 font.pixelSize: Style.font.caption * 0.8
+                                font.bold: Boolean(modelData.branch_mismatch)
                                 anchors.verticalCenter: parent.verticalCenter
                               }
                             }
@@ -2925,6 +3189,45 @@ BarWidget {
                           anchors.right: parent.right
                           anchors.verticalCenter: parent.verticalCenter
                           spacing: Style.space(6)
+
+                          // 单仓对齐按钮 (在分支不一致或未克隆时显示)
+                          Rectangle {
+                            visible: Boolean(modelData.branch_mismatch || modelData.is_missing)
+                            height: Style.space(20)
+                            width: subSyncBtnRow.implicitWidth + Style.space(10)
+                            radius: Style.space(3)
+                            color: subSyncBtnArea.containsMouse ? root.colors.surface2 : root.colors.surface1
+                            border.color: root.colors.yellow
+                            border.width: 1
+
+                            MouseArea {
+                              id: subSyncBtnArea
+                              anchors.fill: parent
+                              hoverEnabled: true
+                              cursorShape: Qt.PointingHandCursor
+                              enabled: !root.gitChecking
+                              onClicked: root.syncDepSwitch(modelData.name)
+                            }
+
+                            Row {
+                              id: subSyncBtnRow
+                              anchors.centerIn: parent
+                              spacing: Style.space(4)
+                              Text {
+                                text: (root.gitSyncingDeps && root.syncingRepoName === modelData.name) ? "\uf021" : "\uf0ec"
+                                color: root.colors.yellow
+                                font.family: "JetBrainsMono Nerd Font, monospace"
+                                font.pixelSize: Style.font.caption * 0.75
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
+                              Text {
+                                text: (root.gitSyncingDeps && root.syncingRepoName === modelData.name) ? "对齐中" : "对齐"
+                                color: root.colors.text
+                                font.pixelSize: Style.font.caption * 0.75
+                                anchors.verticalCenter: parent.verticalCenter
+                              }
+                            }
+                          }
 
                           // 单仓拉取按钮 (仅在 behind > 0 时显示)
                           Rectangle {

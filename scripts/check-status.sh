@@ -8,10 +8,12 @@ set -o pipefail
 CONFIG_FILE="$HOME/.config/harmony/config.json"
 MAC_HOST=""
 PROJECT_PATH=""
+DEVICE_IP=""
 
 if [ -f "$CONFIG_FILE" ]; then
   MAC_HOST=$(jq -r '.macHost // empty' "$CONFIG_FILE" 2>/dev/null || true)
   PROJECT_PATH=$(jq -r '.projectPath // empty' "$CONFIG_FILE" 2>/dev/null || true)
+  DEVICE_IP=$(jq -r '.deviceIp // empty' "$CONFIG_FILE" 2>/dev/null || true)
 fi
 
 while [[ $# -gt 0 ]]; do
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --path)
       PROJECT_PATH="$2"
+      shift 2
+      ;;
+    --device-ip)
+      DEVICE_IP="$2"
       shift 2
       ;;
     *)
@@ -42,13 +48,24 @@ fi
 export PATH="$HOME/.local/harmonyos/command-line-tools/bin:$PATH"
 DEVICE_NAME=""
 DEVICE_ONLINE=false
+IS_WIRELESS=false
 
 if command -v hdc >/dev/null 2>&1; then
   hdc start >/dev/null 2>&1 </dev/null || true
   HDC_OUT=$(timeout 3 hdc list targets 2>/dev/null | tr -d '\r' | grep -v '^\[Client\]' | grep -v '^$' || true)
+  
+  # 若未检测到在线设备且配置了设备无线 IP，尝试静默自动连接
+  if { [ -z "$HDC_OUT" ] || echo "$HDC_OUT" | grep -qi "Empty"; } && [ -n "$DEVICE_IP" ]; then
+    TARGET_IP="$DEVICE_IP"
+    [[ "$TARGET_IP" != *:* ]] && TARGET_IP="${TARGET_IP}:5555"
+    timeout 2 hdc tconn "$TARGET_IP" >/dev/null 2>&1 || true
+    HDC_OUT=$(timeout 3 hdc list targets 2>/dev/null | tr -d '\r' | grep -v '^\[Client\]' | grep -v '^$' || true)
+  fi
+
   if [ -n "$HDC_OUT" ] && ! echo "$HDC_OUT" | grep -qi "Empty"; then
     DEV_ID=$(echo "$HDC_OUT" | head -n 1 | awk '{print $1}' | tr -d '\r\n')
     if [ -n "$DEV_ID" ]; then
+      [[ "$DEV_ID" == *:* ]] && IS_WIRELESS=true
       MODEL=$(timeout 2 hdc -t "$DEV_ID" shell param get const.product.model 2>/dev/null | tr -d '\r\n ' || true)
       if [ -n "$MODEL" ] && ! echo "$MODEL" | grep -qi -E "fail|error"; then
         DEVICE_NAME="$DEV_ID ($MODEL)"
@@ -112,6 +129,8 @@ jq -n \
   --arg mac_host "$MAC_HOST" \
   --argjson device_online "$DEVICE_ONLINE" \
   --arg device_name "${DEVICE_NAME:-离线}" \
+  --argjson is_wireless "$IS_WIRELESS" \
+  --arg device_ip "${DEVICE_IP:-}" \
   --argjson project_ok "$PROJECT_OK" \
   --arg project_path "${DETECTED_PROJECT:-}" \
   --arg project_name "${PROJECT_NAME:-}" \
@@ -121,6 +140,8 @@ jq -n \
     mac_host: $mac_host,
     device_online: $device_online,
     device_name: $device_name,
+    is_wireless: $is_wireless,
+    device_ip: $device_ip,
     project_ok: $project_ok,
     project_path: $project_path,
     project_name: $project_name,

@@ -89,6 +89,7 @@ omarchy plugin validate .
   "remoteDir": "~/Dev/harmony",
   "projectPath": "/home/zhouatie/Work/harmony/CloudMusicHarmony",
   "trunkBranch": "release-20260921",
+  "deviceIp": "192.168.1.100",
   "autoInstall": true,
   "autoLaunch": true
 }
@@ -98,7 +99,8 @@ omarchy plugin validate .
 - **remoteDir**：Mac 远程基础目录，每个工程会自动归纳在 `<remoteDir>/<工程名>` 下，互不冲突。
 - **projectPath**：本地工程根目录（包含 `build-profile.json5`）。留空时将按当前打开的终端目录自动向上探测。
 - **trunkBranch**：比对的目标主干分支名称（如 `release-20260921` 或 `master`）。留空时智能自动探测工程基线。
-- **autoInstall**：是否在构建完成后通过 USB 自动安装到真机。
+- **deviceIp**：真机无线调试 IP（如 `192.168.1.100` 或 `192.168.1.100:5555`）。配置后支持真机掉线时自动静默重连与面板一键重连。
+- **autoInstall**：是否在构建完成后通过 USB / 无线网络自动安装到真机。
 - **autoLaunch**：是否在安装完成后通过 HDC 自动拉起 `EntryAbility`。
 
 ---

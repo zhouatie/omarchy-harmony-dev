@@ -12,3 +12,12 @@ Thumbs.db
 .cache/
 __pycache__/
 *.pyc
+
+# Local agent & skills
+.agents/
+.codex/
+.gemini/
+.claude/
+.pi/
+.github/skills/
+
