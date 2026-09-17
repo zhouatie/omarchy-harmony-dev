@@ -112,7 +112,7 @@ print_usage() {
   --install-only, -i    仅安装本地已有的 HAP 安装包到真机，跳过同步与远程构建
   --sync-only           仅同步本地代码至 Mac mini，不执行构建
   --build-only          跳过代码同步，直接在 Mac mini 上构建并拉取产物
-  --deps                在远程执行 ohpm install 安装/更新三方依赖
+  --deps, --deps-only   递归执行 ohpm install --all 安装主工程及所有子包依赖 (本地+远程)
   --sync-deps           构建前根据 dep-switch.json5 自动对齐并同步子仓代码
   --clean               在远程执行深度清理(清缓存+clean)，提MR前推荐执行以对齐CI环境
   --no-launch           安装成功后不自动拉起 EntryAbility
@@ -146,10 +146,16 @@ while [[ $# -gt 0 ]]; do
       ;;
     --build-only)
       DO_SYNC=false
+      EXPLICIT_BUILD=true
       shift
       ;;
-    --deps)
+    --deps|--deps-only)
       DO_DEPS=true
+      if [ "${EXPLICIT_BUILD:-false}" != true ]; then
+        DO_BUILD=false
+        DO_INSTALL_APP=false
+        DO_LAUNCH=false
+      fi
       shift
       ;;
     --sync-deps)
@@ -279,6 +285,40 @@ if [ "$DO_SYNC_DEPS" = true ]; then
 fi
 
 # ------------------------------------------------------------------------------
+# 步骤 0.9: 本地执行 ohpm install --all 与 hvigor sync (递归安装主工程及所有子包)
+# ------------------------------------------------------------------------------
+if [ "$DO_DEPS" = true ]; then
+  STEP_DEPS_LOCAL=$(date +%s)
+  log_step "0.9. 在本地执行 ohpm install --all (递归安装主工程及所有子包依赖)..."
+  OHPM_CMD=""
+  if command -v ohpm >/dev/null 2>&1; then
+    OHPM_CMD="ohpm"
+  elif [ -f "$HOME/.local/harmonyos/command-line-tools/bin/ohpm" ]; then
+    OHPM_CMD="$HOME/.local/harmonyos/command-line-tools/bin/ohpm"
+  fi
+
+  if [ -n "$OHPM_CMD" ]; then
+    log_info "正在本地执行: $OHPM_CMD install --all..."
+    (cd "$PROJECT_ROOT" && "$OHPM_CMD" install --all)
+  else
+    log_warn "未在本地找到 ohpm 命令，跳过本地依赖安装"
+  fi
+
+  HVIGOR_CMD=""
+  if command -v hvigorw >/dev/null 2>&1; then
+    HVIGOR_CMD="hvigorw"
+  elif [ -f "$HOME/.local/harmonyos/command-line-tools/bin/hvigorw" ]; then
+    HVIGOR_CMD="$HOME/.local/harmonyos/command-line-tools/bin/hvigorw"
+  fi
+
+  if [ -n "$HVIGOR_CMD" ]; then
+    log_info "正在本地执行: $HVIGOR_CMD --sync --no-daemon (刷新工程元数据与依赖映射)..."
+    (cd "$PROJECT_ROOT" && "$HVIGOR_CMD" --sync --no-daemon) 2>&1 || true
+  fi
+  log_info "本地主工程与子包依赖安装完成 (耗时: $(format_duration $(( $(date +%s) - STEP_DEPS_LOCAL )) ))！"
+fi
+
+# ------------------------------------------------------------------------------
 # 步骤 1: 检查远程连通性并执行“防覆盖身份校验”
 # ------------------------------------------------------------------------------
 if [ "$DO_SYNC" = true ]; then
@@ -344,8 +384,22 @@ EOF"
 fi
 
 # ------------------------------------------------------------------------------
-# 步骤 2: 在 Mac mini 原生环境满速构建
+# 步骤 2: 在 Mac mini 原生环境满速构建或同步依赖
 # ------------------------------------------------------------------------------
+if [ "$DO_DEPS" = true ] && [ "$DO_BUILD" = false ]; then
+  STEP2_DEPS_REMOTE=$(date +%s)
+  log_step "2. 在 Mac 远程环境执行 ohpm install --all 与 hvigor 同步..."
+  REMOTE_COMMANDS="export DEVELOPER_DIR=/Library/Developer/CommandLineTools; export NODE_HOME=/Applications/DevEco-Studio.app/Contents/tools/node; export DEVECO_SDK_HOME=/Applications/DevEco-Studio.app/Contents/sdk; export JAVA_HOME=/Applications/DevEco-Studio.app/Contents/jbr/Contents/Home; export PATH=/Library/Developer/CommandLineTools/usr/bin:\$JAVA_HOME/bin:/Applications/DevEco-Studio.app/Contents/tools/node/bin:/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin:/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin:/opt/homebrew/bin:\$PATH; cd $REMOTE_WORK_DIR && ohpm install --all && hvigorw --sync --no-daemon"
+  if ssh -tt "$MAC_HOST" "$REMOTE_COMMANDS" 2>&1 | tee -a "$LOG_FILE"; then
+    log_info "远程主工程及子包依赖安装同步成功 (耗时: $(format_duration $(( $(date +%s) - STEP2_DEPS_REMOTE )) ))！"
+  else
+    log_warn "远程依赖安装遇到警告或错误，请检查日志 $LOG_FILE"
+  fi
+  log_info "✨ 依赖安装全流程就绪！本地与远程的所有子包依赖已全部更新完毕 (总耗时: $(format_duration $(( $(date +%s) - START_TIME_TOTAL )) ))。"
+  notify_desktop "HarmonyOS 依赖安装完成" "主工程与所有子包依赖已全部就绪" "normal"
+  exit 0
+fi
+
 if [ "$DO_BUILD" = true ]; then
   STEP2_START=$(date +%s)
   log_step "2. 在 Mac 原生环境执行构建..."

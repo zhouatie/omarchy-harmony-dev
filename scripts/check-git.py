@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import re
+import shutil
 import argparse
 import subprocess
 from collections import Counter
@@ -85,6 +86,7 @@ def extract_git_dependencies(proj_path, dep_data):
         git_branch = d.get("gitBranch", "").strip()
         deps.append({
             "project": project,
+            "path": d.get("path", "").strip(),
             "gitBranch": git_branch,
             "gitUrl": git_url,
             "gitGroup": git_group,
@@ -186,6 +188,35 @@ def resolve_project_path(specified_path):
 
     return ""
 
+IGNORED_GIT_NAMES = {
+    "oh-package-lock.json5",
+    "BuildProfile.ets",
+    ".DS_Store",
+    "Thumbs.db",
+}
+
+IGNORED_GIT_DIRS = {
+    "build",
+    ".cxx",
+    ".preview",
+    ".hvigor",
+    ".ohpm",
+    "oh_modules",
+    "node_modules",
+    ".idea",
+}
+
+def is_ignored_git_path(path):
+    if not path:
+        return False
+    norm = path.strip().replace("\\", "/").strip("/")
+    parts = norm.split("/")
+    if parts[-1] in IGNORED_GIT_NAMES:
+        return True
+    if any(p in IGNORED_GIT_DIRS for p in parts):
+        return True
+    return False
+
 def check_single_repo(repo_path, do_fetch=False, trunk_branch=""):
     git_dir = os.path.join(repo_path, ".git")
     if not os.path.exists(git_dir):
@@ -227,18 +258,25 @@ def check_single_repo(repo_path, do_fetch=False, trunk_branch=""):
                     except ValueError:
                         pass
             elif line.startswith("? "):
+                path = line[2:].strip()
+                if is_ignored_git_path(path):
+                    continue
                 untracked += 1
                 if len(changed_files) < 50:
                     changed_files.append({
                         "status": "??",
-                        "path": line[2:].strip()
+                        "path": path
                     })
             elif line.startswith("1 ") or line.startswith("2 ") or line.startswith("u "):
+                parts = line.split(maxsplit=8)
+                path = parts[8] if len(parts) > 8 else ""
+                if "\t" in path:
+                    path = path.split("\t")[0]
+                if is_ignored_git_path(path):
+                    continue
                 modified += 1
                 if len(changed_files) < 50:
-                    parts = line.split(maxsplit=8)
                     xy = parts[1] if len(parts) > 1 else "M"
-                    path = parts[8] if len(parts) > 8 else ""
                     st = "M"
                     if "A" in xy:
                         st = "A"
@@ -309,6 +347,56 @@ def check_single_repo(repo_path, do_fetch=False, trunk_branch=""):
     except Exception as e:
         return {"error": str(e)}
 
+def find_ohpm_bin():
+    candidates = [
+        shutil.which("ohpm"),
+        os.path.expanduser("~/.local/harmonyos/command-line-tools/bin/ohpm"),
+        "/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin/ohpm"
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return "ohpm"
+
+def find_hvigor_bin():
+    candidates = [
+        shutil.which("hvigorw"),
+        os.path.expanduser("~/.local/harmonyos/command-line-tools/bin/hvigorw"),
+        "/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw"
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+def find_repo_package_dirs(repo_path, dep_info=None):
+    package_dirs = []
+    if dep_info and dep_info.get("path"):
+        custom_p = os.path.join(os.path.dirname(repo_path), dep_info["path"])
+        if os.path.exists(os.path.join(custom_p, "oh-package.json5")):
+            package_dirs.append(custom_p)
+    if os.path.exists(os.path.join(repo_path, "oh-package.json5")):
+        if repo_path not in package_dirs:
+            package_dirs.append(repo_path)
+    for root_dir, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in [".git", "oh_modules", "node_modules", "build", ".hvigor", ".cxx", ".idea"]]
+        rel = os.path.relpath(root_dir, repo_path)
+        if rel.count(os.sep) > 2:
+            dirs[:] = []
+            continue
+        if "oh-package.json5" in files:
+            if root_dir not in package_dirs:
+                package_dirs.append(root_dir)
+    return package_dirs
+
+def install_subpkg_deps(dir_path, timeout=30):
+    ohpm_bin = find_ohpm_bin()
+    try:
+        res = subprocess.run([ohpm_bin, "install"], cwd=dir_path, capture_output=True, text=True, timeout=timeout)
+        return res.returncode == 0, res.stdout.strip() or res.stderr.strip()
+    except Exception as e:
+        return False, str(e)
+
 def pull_single_repo(repo_path, name=""):
     repo_name = name or os.path.basename(repo_path)
     git_dir = os.path.join(repo_path, ".git")
@@ -327,7 +415,7 @@ def pull_single_repo(repo_path, name=""):
     except Exception as e:
         return {"name": repo_name, "path": repo_path, "ok": False, "msg": str(e)}
 
-def sync_single_dep_repo(dep_info, target_lib_dir):
+def sync_single_dep_repo(dep_info, target_lib_dir, auto_install=True, proj_path=None):
     name = dep_info["project"]
     target_branch = dep_info.get("gitBranch", "").strip()
     git_url = dep_info.get("gitUrl", "").strip()
@@ -336,7 +424,7 @@ def sync_single_dep_repo(dep_info, target_lib_dir):
     if not os.path.exists(repo_path):
         # Missing repo: clone it
         if not git_url:
-            return {"name": name, "ok": False, "skipped": False, "msg": "未配置 gitUrl，无法克隆"}
+            return {"name": name, "ok": False, "skipped": False, "msg": "未配置 gitUrl，无法克隆", "changed": False}
         try:
             os.makedirs(target_lib_dir, exist_ok=True)
             cmd = ["git", "clone"]
@@ -345,27 +433,51 @@ def sync_single_dep_repo(dep_info, target_lib_dir):
             cmd.extend([git_url, repo_path])
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if res.returncode == 0:
-                return {"name": name, "ok": True, "skipped": False, "msg": f"克隆成功 ({target_branch or 'default'})"}
+                installed = False
+                if auto_install:
+                    pkg_dirs = find_repo_package_dirs(repo_path, dep_info)
+                    for pd in pkg_dirs:
+                        ok_inst, _ = install_subpkg_deps(pd)
+                        if ok_inst:
+                            installed = True
+                    if installed and proj_path:
+                        hvigor_bin = find_hvigor_bin()
+                        if hvigor_bin:
+                            subprocess.run([hvigor_bin, "--sync", "--no-daemon"], cwd=proj_path, capture_output=True, timeout=30)
+                msg = f"克隆成功 ({target_branch or 'default'})"
+                if installed:
+                    msg += "，已装子包依赖"
+                return {"name": name, "ok": True, "skipped": False, "msg": msg, "changed": True}
             else:
                 err = res.stderr.strip() or res.stdout.strip()
-                return {"name": name, "ok": False, "skipped": False, "msg": f"克隆失败: {err}"}
+                return {"name": name, "ok": False, "skipped": False, "msg": f"克隆失败: {err}", "changed": False}
         except subprocess.TimeoutExpired:
-            return {"name": name, "ok": False, "skipped": False, "msg": "克隆超时 (60s)"}
+            return {"name": name, "ok": False, "skipped": False, "msg": "克隆超时 (60s)", "changed": False}
         except Exception as e:
-            return {"name": name, "ok": False, "skipped": False, "msg": f"克隆异常: {str(e)}"}
+            return {"name": name, "ok": False, "skipped": False, "msg": f"克隆异常: {str(e)}", "changed": False}
 
     git_dir = os.path.join(repo_path, ".git")
     if not os.path.exists(git_dir):
-        return {"name": name, "ok": False, "skipped": True, "msg": "非 Git 仓库，跳过"}
+        return {"name": name, "ok": False, "skipped": True, "msg": "非 Git 仓库，跳过", "changed": False}
 
     # Check if dirty
     try:
         st_res = subprocess.run(["git", "-C", repo_path, "status", "--porcelain"], capture_output=True, text=True, timeout=5)
         if st_res.returncode != 0:
-            return {"name": name, "ok": False, "skipped": False, "msg": "git status 失败"}
-        is_dirty = bool(st_res.stdout.strip())
-        if is_dirty:
-            return {"name": name, "ok": False, "skipped": True, "msg": "存在本地修改，已安全跳过切换"}
+            return {"name": name, "ok": False, "skipped": False, "msg": "git status 失败", "changed": False}
+        has_real_dirty = False
+        for line in st_res.stdout.splitlines():
+            line_content = line[3:].strip() if len(line) > 3 else line.strip()
+            if " -> " in line_content:
+                line_content = line_content.split(" -> ")[-1].strip()
+            if not is_ignored_git_path(line_content):
+                has_real_dirty = True
+                break
+        if has_real_dirty:
+            return {"name": name, "ok": False, "skipped": True, "msg": "存在本地修改，已安全跳过切换", "changed": False}
+
+        # Record HEAD before checkout/pull
+        head_before = subprocess.run(["git", "-C", repo_path, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3).stdout.strip()
 
         # Get current branch
         br_res = subprocess.run(["git", "-C", repo_path, "branch", "--show-current"], capture_output=True, text=True, timeout=5)
@@ -377,27 +489,54 @@ def sync_single_dep_repo(dep_info, target_lib_dir):
             if ck_local.returncode == 0:
                 sw_res = subprocess.run(["git", "-C", repo_path, "checkout", target_branch], capture_output=True, text=True, timeout=10)
                 if sw_res.returncode != 0:
-                    return {"name": name, "ok": False, "skipped": False, "msg": f"切换分支失败: {sw_res.stderr.strip() or sw_res.stdout.strip()}"}
+                    return {"name": name, "ok": False, "skipped": False, "msg": f"切换分支失败: {sw_res.stderr.strip() or sw_res.stdout.strip()}", "changed": False}
             else:
                 subprocess.run(["git", "-C", repo_path, "fetch", "origin", target_branch], capture_output=True, timeout=15)
                 sw_res = subprocess.run(["git", "-C", repo_path, "checkout", "-b", target_branch, f"origin/{target_branch}"], capture_output=True, text=True, timeout=10)
                 if sw_res.returncode != 0:
                     sw_res = subprocess.run(["git", "-C", repo_path, "checkout", target_branch], capture_output=True, text=True, timeout=10)
                     if sw_res.returncode != 0:
-                        return {"name": name, "ok": False, "skipped": False, "msg": f"检出目标分支 {target_branch} 失败: {sw_res.stderr.strip() or sw_res.stdout.strip()}"}
+                        return {"name": name, "ok": False, "skipped": False, "msg": f"检出目标分支 {target_branch} 失败: {sw_res.stderr.strip() or sw_res.stdout.strip()}", "changed": False}
 
         # Pull fast-forward
         pull_res = subprocess.run(["git", "-C", repo_path, "pull", "--ff-only"], capture_output=True, text=True, timeout=25)
         if pull_res.returncode == 0:
+            head_after = subprocess.run(["git", "-C", repo_path, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3).stdout.strip()
+            changed = (head_before != head_after)
+
+            installed = False
+            pkg_dirs = find_repo_package_dirs(repo_path, dep_info)
+            if auto_install:
+                needs_install = False
+                for pd in pkg_dirs:
+                    if not os.path.exists(os.path.join(pd, "oh_modules")):
+                        needs_install = True
+                        break
+                if not needs_install and changed and head_before and head_after:
+                    diff_res = subprocess.run(["git", "-C", repo_path, "diff", head_before, head_after, "--name-only"], capture_output=True, text=True, timeout=5)
+                    if "oh-package.json5" in diff_res.stdout or "oh-package.json" in diff_res.stdout:
+                        needs_install = True
+                if needs_install:
+                    for pd in pkg_dirs:
+                        ok_inst, _ = install_subpkg_deps(pd)
+                        if ok_inst:
+                            installed = True
+                    if installed and proj_path:
+                        hvigor_bin = find_hvigor_bin()
+                        if hvigor_bin:
+                            subprocess.run([hvigor_bin, "--sync", "--no-daemon"], cwd=proj_path, capture_output=True, timeout=30)
+
             msg = f"已对齐 {target_branch}" if target_branch else "已拉取最新"
-            return {"name": name, "ok": True, "skipped": False, "msg": msg}
+            if installed:
+                msg += " (子包依赖已更新)"
+            return {"name": name, "ok": True, "skipped": False, "msg": msg, "changed": changed}
         else:
             err = pull_res.stderr.strip() or pull_res.stdout.strip()
-            return {"name": name, "ok": False, "skipped": False, "msg": f"pull 失败: {err}"}
+            return {"name": name, "ok": False, "skipped": False, "msg": f"pull 失败: {err}", "changed": False}
     except subprocess.TimeoutExpired:
-        return {"name": name, "ok": False, "skipped": False, "msg": "操作超时 (25s)"}
+        return {"name": name, "ok": False, "skipped": False, "msg": "操作超时 (25s)", "changed": False}
     except Exception as e:
-        return {"name": name, "ok": False, "skipped": False, "msg": str(e)}
+        return {"name": name, "ok": False, "skipped": False, "msg": str(e), "changed": False}
 
 def main():
     args = parse_args()
@@ -431,6 +570,7 @@ def main():
 
     # Execute sync if requested
     sync_results = []
+    subpkg_deps_installed = False
     if args.sync_dep_repo:
         target_name = args.sync_dep_repo.strip()
         matched_dep = None
@@ -439,18 +579,47 @@ def main():
                 matched_dep = d
                 break
         if matched_dep:
-            sync_results.append(sync_single_dep_repo(matched_dep, target_lib_dir))
+            res = sync_single_dep_repo(matched_dep, target_lib_dir, auto_install=True, proj_path=proj_path)
+            if "子包依赖已更新" in res.get("msg", "") or "已装子包依赖" in res.get("msg", ""):
+                subpkg_deps_installed = True
+            sync_results.append(res)
         else:
             sync_results.append({
                 "name": target_name,
                 "ok": False,
                 "skipped": False,
-                "msg": f"dep-switch.json5 中未找到依赖 {target_name}"
+                "msg": f"dep-switch.json5 中未找到依赖 {target_name}",
+                "changed": False
             })
     elif args.sync_deps:
         if git_deps:
             with ThreadPoolExecutor(max_workers=8) as sync_exec:
-                sync_results = list(sync_exec.map(lambda d: sync_single_dep_repo(d, target_lib_dir), git_deps))
+                sync_results = list(sync_exec.map(lambda d: sync_single_dep_repo(d, target_lib_dir, auto_install=False, proj_path=proj_path), git_deps))
+
+            any_changed = any(r.get("changed") for r in sync_results if r.get("ok"))
+            # Also check if any submodule is missing oh_modules
+            if not any_changed:
+                for d in git_deps:
+                    rp = os.path.join(target_lib_dir, d["project"])
+                    if os.path.isdir(rp):
+                        pdirs = find_repo_package_dirs(rp, d)
+                        if any(not os.path.exists(os.path.join(pd, "oh_modules")) for pd in pdirs):
+                            any_changed = True
+                            break
+
+            if any_changed:
+                ohpm_bin = find_ohpm_bin()
+                try:
+                    subprocess.run([ohpm_bin, "install", "--all"], cwd=proj_path, capture_output=True, timeout=60)
+                    subpkg_deps_installed = True
+                except Exception:
+                    pass
+                hvigor_bin = find_hvigor_bin()
+                if hvigor_bin:
+                    try:
+                        subprocess.run([hvigor_bin, "--sync", "--no-daemon"], cwd=proj_path, capture_output=True, timeout=45)
+                    except Exception:
+                        pass
 
     subdirs = []
     if os.path.isdir(target_lib_dir):
@@ -701,6 +870,7 @@ def main():
         "mr_summary": mr_summary,
         "pull_results": pull_results,
         "sync_results": sync_results,
+        "subpkg_deps_installed": subpkg_deps_installed,
         "dep_switch": dep_switch_summary
     }
     print(json.dumps(output, ensure_ascii=False))

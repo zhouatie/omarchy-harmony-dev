@@ -404,8 +404,8 @@ BarWidget {
     root.building = true
     root.currentBuildMode = mode
     root.buildElapsedSeconds = 0
-    root.buildStage = (mode === "install-only" ? "4. 检测真机并准备安装..." : (mode === "sync-only" ? "1. 同步工程源码..." : "正在初始化..."))
-    root.buildStatus = (mode === "install-only" ? "安装中..." : (mode === "sync-only" ? "同步中..." : "构建中..."))
+    root.buildStage = (mode === "install-only" ? "4. 检测真机并准备安装..." : (mode === "sync-only" ? "1. 同步工程源码..." : (mode === "deps" ? "安装主工程及子包依赖..." : "正在初始化...")))
+    root.buildStatus = (mode === "install-only" ? "安装中..." : (mode === "sync-only" ? "同步中..." : (mode === "deps" ? "装依赖中..." : "构建中...")))
     root.buildErrorCount = 0
     root.logFeedback = ""
     root.buildLogs = ["[" + new Date().toLocaleTimeString() + "] 开始执行模式: " + mode]
@@ -439,7 +439,7 @@ BarWidget {
     } else if (mode === "clean") {
       args.push("--clean")
     } else if (mode === "deps") {
-      args.push("--deps")
+      args.push("--deps-only")
     }
 
     buildProc.command = args
@@ -636,7 +636,8 @@ BarWidget {
             }
             var sMsg = ""
             if (syncFailed === 0 && syncSkipped === 0) {
-              sMsg = (syncSuccess === 1 ? "依赖已对齐 ✓" : ("已对齐 " + syncSuccess + " 仓 ✓"))
+              var suffix = res.subpkg_deps_installed ? " (含子包依赖) ✓" : " ✓"
+              sMsg = (syncSuccess === 1 ? ("依赖已对齐" + suffix) : ("已对齐 " + syncSuccess + " 仓" + suffix))
             } else if (syncFailed === 0) {
               sMsg = "对齐 " + syncSuccess + " 仓，" + syncSkipped + " 仓跳过(有修改)"
             } else {
@@ -1971,7 +1972,7 @@ BarWidget {
                   }
 
                   Text {
-                    text: "安装依赖 (ohpm)"
+                    text: "安装依赖 (--all)"
                     color: b5Area.containsMouse ? root.colors.text : root.colors.subtext1
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
