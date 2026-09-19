@@ -18,6 +18,7 @@ set -eo pipefail
 cleanup() {
   # 终止本脚本产生的所有子进程 (如 ssh, rsync, tee 等)
   pkill -P $$ 2>/dev/null || true
+  exit 130
 }
 trap cleanup INT TERM
 
