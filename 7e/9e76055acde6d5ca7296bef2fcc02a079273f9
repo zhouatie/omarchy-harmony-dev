@@ -1,0 +1,19 @@
+scripts/hm-build.sh
+  s_4fbb924a71ba7e::t_5b237051dc2700 21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7e9e76055acde6d5ca7296bef2fcc02a079273f9",
+  "prompts": {},
+  "sessions": {
+    "s_4fbb924a71ba7e": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0b7fb-472b-732f-b0a8-26f43704836f",
+        "model": "gemini-3.8-flash"
+      },
+      "human_author": "zhouatie <zhouatie@gmail.com>"
+    }
+  }
+}
